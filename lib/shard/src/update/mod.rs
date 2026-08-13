@@ -87,8 +87,13 @@ pub fn process_point_operation(
                 // An empty upsert touches no segment; bump so WAL can acknowledge it.
                 segments.bump_max_segment_version_overwrite(op_num);
             }
-            let res =
-                upsert_points_raw(segments, op_num, &points, max_segment_size_bytes, hw_counter)?;
+            let res = upsert_points_raw(
+                segments,
+                op_num,
+                &points,
+                max_segment_size_bytes,
+                hw_counter,
+            )?;
             Ok(res)
         }
         PointOperations::SyncPointsRaw(mut operation) => {
