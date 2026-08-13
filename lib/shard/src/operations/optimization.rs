@@ -134,9 +134,7 @@ pub struct OptimizerThresholds {
 }
 
 impl OptimizerThresholds {
-    /// The appendable segment size cap in bytes, or `None` when `max_segment_size_kb` is zero
-    /// (uncapped). The single derivation of the cap: the segment holder steers writes with it and
-    /// the optimizer provisions against it, so the two cannot disagree on what "full" means.
+    /// Maximum segment size in bytes, or `None` when `max_segment_size_kb` is zero (uncapped).
     pub fn max_segment_size_bytes(&self) -> Option<NonZeroUsize> {
         NonZeroUsize::new(self.max_segment_size_kb.saturating_mul(BYTES_IN_KB))
     }

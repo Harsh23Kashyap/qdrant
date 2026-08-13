@@ -40,9 +40,7 @@ impl EdgeShard {
                     &segments_guard,
                     operation_id,
                     point_operation,
-                    // Edge shards keep a single appendable segment, so there is no destination to
-                    // steer between and no size cap to apply.
-                    None,
+                    None, // edge shards have a single appendable segment, no size cap to apply
                     &hw_counter,
                 )
             }

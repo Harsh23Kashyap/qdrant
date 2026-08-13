@@ -450,8 +450,6 @@ impl UpdateWorkers {
         thresholds_config: &OptimizerThresholds,
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
     ) -> OperationResult<()> {
-        // Same eligibility rule the segment holder steers copy-on-write moves with, so the segment
-        // provisioned here is exactly the one those moves then target.
         let no_segment_with_capacity = !segments
             .read()
             .has_appendable_segment_with_capacity(thresholds_config.max_segment_size_bytes());

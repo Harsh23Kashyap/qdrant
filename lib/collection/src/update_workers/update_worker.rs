@@ -59,8 +59,8 @@ impl UpdateWorkers {
         applied_seq_handler: Arc<AppliedSeqHandler>,
         cancel: CancellationToken,
     ) -> Receiver<UpdateSignal> {
-        // Sourced from the first optimizer like the optimization worker does, so the two cannot
-        // disagree on what "full" means. Resolved once: a config update restarts the workers.
+        // Take thresholds from the first optimizer, like the optimization worker does.
+        // Resolved once, a config update restarts the workers.
         let capacity_optimizer = optimizers.first().cloned();
         let max_segment_size_bytes = capacity_optimizer
             .as_ref()
@@ -135,9 +135,8 @@ impl UpdateWorkers {
                     let capacity_optimizer_clone = capacity_optimizer.clone();
                     let payload_index_schema_clone = payload_index_schema.clone();
                     let operation_result = tokio::task::spawn_blocking(move || {
-                        // Give the operation a destination below the size cap before applying it,
-                        // rather than letting it grow an already full segment. Best effort: unlike
-                        // the optimization worker, a failure here must not take down a live write.
+                        // Make sure a destination below the size cap exists before applying.
+                        // Best effort, a failure here must not fail the write itself.
                         if let Some(optimizer) = capacity_optimizer_clone
                             && let Err(err) = Self::ensure_appendable_segment_with_capacity(
                                 &segments_clone,
@@ -420,16 +419,16 @@ mod tests {
     use crate::optimizers_builder::build_optimizers;
     use crate::tests::fixtures::create_collection_config;
 
-    /// The worker must provision capacity before applying, and apply with the cap. Only the
-    /// update worker runs here: the optimization worker provisions on every wake-up too, so a new
-    /// segment appearing would prove nothing about this path.
+    /// Check that the update worker provisions a segment with capacity before applying, and
+    /// applies with the size cap. The optimization worker is not running here, so the new
+    /// segment can only come from the update worker itself.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_update_worker_provisions_capacity_before_applying() {
         let dir = Builder::new().prefix("shard").tempdir().unwrap();
         let hw_counter = common::counter::hardware_counter::HardwareCounterCell::new();
 
-        // 1 KB is one vector of size 256, so a few points put the appendable segment over the cap
-        // below. The immutable segment holds the point the filtered update matches.
+        // With 256-dim vectors a single point exceeds the 1 KB cap configured below.
+        // The non-appendable segment holds the point the filtered update matches.
         const DIM: usize = 256;
         let mut holder = SegmentHolder::default();
         let full_id = holder.add_new(random_segment(dir.path(), 100, 3, DIM));
@@ -466,7 +465,7 @@ mod tests {
             .unwrap();
         assert!(
             full_size > BYTES_IN_KB,
-            "the fixture must exceed the 1 KB cap set below, measured {full_size}",
+            "Segment should exceed the 1 KB cap"
         );
 
         let mut config: CollectionConfigInternal = create_collection_config();
@@ -546,7 +545,7 @@ mod tests {
         assert_eq!(
             segments.read().len(),
             3,
-            "the worker must provision a fresh appendable segment before applying",
+            "Worker should provision a new appendable segment before applying",
         );
         assert!(
             !segments
@@ -556,7 +555,7 @@ mod tests {
                 .get()
                 .read()
                 .has_point(100.into(), common::types::DeferredBehavior::WithDeferred),
-            "the worker must apply with the cap, so the moved point avoids the full segment",
+            "Moved point should not land in the full segment",
         );
 
         cancel.cancel();

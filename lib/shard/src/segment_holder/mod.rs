@@ -431,11 +431,9 @@ impl SegmentHolder {
         self.appendable_segments.keys().copied().collect()
     }
 
-    /// Appendable segment IDs measuring below `max_segment_size_bytes`, sorted by ID.
+    /// Return appendable segment IDs smaller than `max_segment_size_bytes`, sorted by IDs.
     ///
-    /// Segments that cannot be measured right now stay eligible: the cap is soft and liveness wins
-    /// over precision. Shared with the optimizer's capacity-ensure step, so the segment it
-    /// provisions is exactly the one copy-on-write moves then target.
+    /// Segments that cannot be measured right now stay eligible, the size cap is best effort.
     fn eligible_appendable_segments_ids(
         &self,
         max_segment_size_bytes: Option<NonZeroUsize>,
@@ -463,8 +461,8 @@ impl SegmentHolder {
             .collect()
     }
 
-    /// Whether at least one appendable segment is below `max_segment_size_bytes`. `false` without
-    /// any appendable segment, so a caller provisioning capacity creates the first one.
+    /// Whether at least one appendable segment is smaller than `max_segment_size_bytes`.
+    /// Also `false` when there is no appendable segment at all.
     pub fn has_appendable_segment_with_capacity(
         &self,
         max_segment_size_bytes: Option<NonZeroUsize>,
@@ -474,11 +472,11 @@ impl SegmentHolder {
             .is_empty()
     }
 
-    /// Copy-on-write move destinations, computed on the first point that needs a move (a batch
-    /// applying fully in place pays for no measurements) and cached for the rest of the call.
+    /// Candidate destinations for copy-on-write moves, computed lazily on the first move and
+    /// kept in `cache` for the rest of the call.
     ///
-    /// Falls back to every appendable segment when none is below the cap: a write must never fail
-    /// for lack of capacity. Callers batch points, so a destination can overshoot by one batch.
+    /// Falls back to all appendable segments when none is below the cap, a write must not fail
+    /// for lack of capacity.
     fn cow_destination_candidates<'a>(
         &self,
         cache: &'a mut Option<Vec<SegmentId>>,
