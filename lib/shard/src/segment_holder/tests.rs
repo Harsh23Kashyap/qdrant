@@ -2243,37 +2243,6 @@ fn test_has_appendable_segment_with_capacity() {
 }
 
 #[test]
-fn test_points_fit_below_size_cap() {
-    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
-
-    let mut holder = SegmentHolder::default();
-    assert!(
-        holder.points_fit_below_size_cap(NonZeroUsize::new(1)),
-        "Nothing to judge by, provisioning should stay allowed",
-    );
-
-    // The fixture holds 5 points
-    let segment_id = holder.add_new(build_segment_1(dir.path()));
-    let size = segment_size(&holder, segment_id);
-    assert!(size > 0, "Segment should have non-zero size");
-
-    assert!(holder.points_fit_below_size_cap(None));
-    assert!(
-        holder.points_fit_below_size_cap(NonZeroUsize::new(size)),
-        "The whole segment fits under the cap, so its points do too",
-    );
-    assert!(
-        !holder.points_fit_below_size_cap(NonZeroUsize::new(size / 5)),
-        "The average point is not smaller than the cap",
-    );
-
-    // A segment busy under a write lock cannot be measured and gives no evidence either way
-    let locked_segment = holder.get(segment_id).unwrap().get();
-    let _write_guard = locked_segment.write();
-    assert!(holder.points_fit_below_size_cap(NonZeroUsize::new(1)));
-}
-
-#[test]
 fn test_cow_move_prefers_appendable_segment_below_size_cap() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
 

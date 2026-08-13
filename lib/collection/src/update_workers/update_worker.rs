@@ -427,8 +427,8 @@ mod tests {
         let dir = Builder::new().prefix("shard").tempdir().unwrap();
         let hw_counter = common::counter::hardware_counter::HardwareCounterCell::new();
 
-        // With 256-dim vectors (1 KB per point) a few points exceed the 2 KB cap configured
-        // below. The non-appendable segment holds the point the filtered update matches.
+        // With 256-dim vectors a single point exceeds the 1 KB cap configured below.
+        // The non-appendable segment holds the point the filtered update matches.
         const DIM: usize = 256;
         let mut holder = SegmentHolder::default();
         let full_id = holder.add_new(random_segment(dir.path(), 100, 3, DIM));
@@ -464,14 +464,14 @@ mod tests {
             .max_available_vectors_size_in_bytes()
             .unwrap();
         assert!(
-            full_size > 2 * BYTES_IN_KB,
-            "Segment should exceed the 2 KB cap"
+            full_size > BYTES_IN_KB,
+            "Segment should exceed the 1 KB cap"
         );
 
         let mut config: CollectionConfigInternal = create_collection_config();
         config.params.vectors =
             VectorsConfig::Single(VectorParamsBuilder::new(DIM as u64, Distance::Dot).build());
-        config.optimizer_config.max_segment_size = Some(2);
+        config.optimizer_config.max_segment_size = Some(1);
         let config = Arc::new(TokioRwLock::new(config));
 
         let optimizers = {

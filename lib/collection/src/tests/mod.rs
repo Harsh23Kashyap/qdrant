@@ -347,9 +347,8 @@ async fn test_new_segment_when_all_over_capacity() {
         vectors: VectorsConfig::Single(VectorParamsBuilder::new(dim as u64, Distance::Dot).build()),
         ..CollectionParams::empty()
     };
-    // 2 KB cap: the 3-point segments below (1 KB per point) are over it, while points still fit
     let optimizer_thresholds = OptimizerThresholds {
-        max_segment_size_kb: 2,
+        max_segment_size_kb: 1,
         memmap_threshold_kb: 1_000_000,
         indexing_threshold_kb: 1_000_000,
         deferred_internal_id: None,
@@ -443,53 +442,6 @@ async fn test_new_segment_when_all_over_capacity() {
     assert_eq!(segments.read().len(), 7);
 }
 
-/// A cap smaller than a single point cannot be satisfied: a fresh segment would exceed it on its
-/// first write, and every following operation would provision yet another segment. Provisioning
-/// must decline instead of growing the segment count without bound.
-#[tokio::test]
-async fn test_no_new_segment_when_points_do_not_fit_cap() {
-    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
-
-    // 2 KB per point against a 1 KB cap
-    let dim = 512;
-    let collection_params = CollectionParams {
-        vectors: VectorsConfig::Single(VectorParamsBuilder::new(dim as u64, Distance::Dot).build()),
-        ..CollectionParams::empty()
-    };
-    let optimizer_thresholds = OptimizerThresholds {
-        max_segment_size_kb: 1,
-        memmap_threshold_kb: 1_000_000,
-        indexing_threshold_kb: 1_000_000,
-        deferred_internal_id: None,
-    };
-    let hnsw_config = Default::default();
-    let segment_config =
-        build_segment_optimizer_config(&collection_params, &hnsw_config, &Default::default());
-
-    let payload_schema_file = dir.path().join("payload.schema");
-    let payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>> =
-        Arc::new(SaveOnDisk::load_or_init_default(payload_schema_file).unwrap());
-
-    let mut holder = SegmentHolder::default();
-    holder.add_new(random_segment(dir.path(), 100, 3, dim));
-    let segments = LockedSegmentHolder::new(holder);
-
-    UpdateWorkers::ensure_appendable_segment_with_capacity(
-        &segments,
-        dir.path(),
-        &segment_config,
-        &optimizer_thresholds,
-        payload_index_schema,
-    )
-    .unwrap();
-
-    assert_eq!(
-        segments.read().len(),
-        1,
-        "Provisioning should decline when a point cannot fit under the cap",
-    );
-}
-
 /// Regression test: when a new appendable segment is created at runtime because all existing
 /// appendable segments are over capacity, it must be registered in the manifest *before* it
 /// becomes a live write target. The holder does this automatically when the segment is added; this
@@ -509,7 +461,7 @@ async fn ensure_appendable_segment_registers_in_manifest() {
     };
     // Tiny max segment size so all existing segments are considered over capacity.
     let optimizer_thresholds = OptimizerThresholds {
-        max_segment_size_kb: 2,
+        max_segment_size_kb: 1,
         memmap_threshold_kb: 1_000_000,
         indexing_threshold_kb: 1_000_000,
         deferred_internal_id: None,

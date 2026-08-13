@@ -472,41 +472,6 @@ impl SegmentHolder {
             .is_empty()
     }
 
-    /// Whether a fresh appendable segment could keep taking writes below
-    /// `max_segment_size_bytes`, judged by the average point size of the current appendable
-    /// segments. `true` without a cap, or with nothing measurable to judge by.
-    ///
-    /// Guards capacity provisioning against a cap smaller than a single point: a fresh segment
-    /// would exceed such a cap on its first write, so every operation would provision another
-    /// segment and the segment count would grow without bound.
-    pub fn points_fit_below_size_cap(&self, max_segment_size_bytes: Option<NonZeroUsize>) -> bool {
-        let Some(max_segment_size_bytes) = max_segment_size_bytes else {
-            return true;
-        };
-
-        let mut measured_any = false;
-        for locked_segment in self.appendable_segments.values() {
-            let segment_arc = locked_segment.get();
-            let Some(segment) = segment_arc.try_read() else {
-                continue;
-            };
-            let Ok(size) = segment.max_available_vectors_size_in_bytes() else {
-                continue;
-            };
-            let points = segment.available_point_count();
-            if points == 0 {
-                continue;
-            }
-            // The average point is smaller than the cap, so points fit
-            if size < max_segment_size_bytes.get().saturating_mul(points) {
-                return true;
-            }
-            measured_any = true;
-        }
-
-        !measured_any
-    }
-
     /// Candidate destinations for copy-on-write moves, computed lazily on the first move and
     /// kept in `cache` for the rest of the call.
     ///
