@@ -450,11 +450,18 @@ impl UpdateWorkers {
         thresholds_config: &OptimizerThresholds,
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
     ) -> OperationResult<()> {
-        let no_segment_with_capacity = !segments
-            .read()
-            .has_appendable_segment_with_capacity(thresholds_config.max_segment_size_bytes());
+        let needs_new_segment = {
+            let max_segment_size_bytes = thresholds_config.max_segment_size_bytes();
+            let segments_read = segments.read();
+            !segments_read.has_appendable_segment_with_capacity(max_segment_size_bytes)
+                // A cap smaller than the points themselves cannot be satisfied: a fresh segment
+                // would exceed it on its first write, and every following operation would
+                // provision yet another segment. Decline and let writes fall back to the
+                // existing segments instead.
+                && segments_read.points_fit_below_size_cap(max_segment_size_bytes)
+        };
 
-        if no_segment_with_capacity {
+        if needs_new_segment {
             log::debug!("Creating new appendable segment, all existing segments are over capacity");
 
             let segments_guard = segments.upgradable_read();
