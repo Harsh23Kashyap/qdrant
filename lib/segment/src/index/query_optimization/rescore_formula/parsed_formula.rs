@@ -65,6 +65,8 @@ pub enum ParsedExpression {
     // Nested
     Mult(Vec<ParsedExpression>),
     Sum(Vec<ParsedExpression>),
+    Max(Vec<ParsedExpression>),
+    Min(Vec<ParsedExpression>),
     Div {
         left: Box<ParsedExpression>,
         right: Box<ParsedExpression>,
