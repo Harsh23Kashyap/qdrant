@@ -2479,6 +2479,16 @@ class Expression(Enum):
         ...
 
     @staticmethod
+    def Max(exprs: List["Expression"]) -> "Expression":
+        """Create a maximum expression. Requires at least one operand."""
+        ...
+
+    @staticmethod
+    def Min(exprs: List["Expression"]) -> "Expression":
+        """Create a minimum expression. Requires at least one operand."""
+        ...
+
+    @staticmethod
     def Neg(expr: "Expression") -> "Expression":
         """Create a negation expression."""
         ...
