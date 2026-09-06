@@ -30,8 +30,8 @@ pub struct CachedBlobFsContext<C> {
 /// stays read-only, and the writeable half lives in the combined handle.
 #[derive(Clone)]
 pub struct CachedBlobFs<A: AsyncRead + Clone> {
-    cache_fs: DiskCacheFs<BlobFile<A>>,
-    blob_fs: BlobFs<A>,
+    pub(super) cache_fs: DiskCacheFs<BlobFile<A>>,
+    pub(super) blob_fs: BlobFs<A>,
 }
 
 impl<A: AsyncRead + Clone> CachedBlobFs<A> {

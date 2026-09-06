@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use common::counter::counter_cell::CounterCell;
 use common::counter::hardware_counter::HardwareCounterCell;
@@ -45,7 +46,7 @@ impl<V: Blob, S: UniversalRead> BlobstoreReader<V, S> {
     ) -> Result<()> {
         // schedule config file, so the config read in `open` is served from the prefetch pool
         let config_path = base_path.join(CONFIG_FILENAME);
-        fs.schedule_prefetch(&config_path, None, None)?;
+        fs.schedule_open(&config_path, None, None);
 
         // Don't read config now; instead, probe all modes and ignore not-found errors
         for mode in Mode::iter() {
@@ -217,7 +218,10 @@ impl<V: Blob, S: UniversalRead> BlobstoreReader<V, S> {
         }
     }
 
-    pub fn live_preload<Fs: CachedReadFs<File = S>>(&self, fs: &Fs) -> Result<()> {
+    pub fn live_preload<Fs: CachedReadFs<File = S>>(
+        &self,
+        fs: &Fs,
+    ) -> Result<Vec<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>> {
         match self {
             Self::Gridstore(reader) => reader.live_preload(fs),
             Self::Logstore(reader) => reader.live_preload(fs),

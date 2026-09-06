@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use ahash::{HashMap, HashSet};
 use common::generic_consts::AccessPattern;
@@ -60,11 +61,11 @@ impl<S: UniversalRead> AppendOnlyPages<S> {
             if !page_files.contains(&path) {
                 break;
             }
-            fs.schedule_prefetch(
+            fs.schedule_open(
                 &path,
                 Some(AppendOnlyPage::<S>::open_options(populate, false)),
                 None,
-            )?;
+            );
         }
         Ok(())
     }
@@ -270,16 +271,18 @@ impl<S: UniversalRead> AppendOnlyPages<S> {
         &self,
         fs: &Fs,
         populate: Populate,
-    ) -> Result<()> {
+    ) -> Result<Vec<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>> {
         let page_list: HashMap<_, _> = fs
             .list_files(&self.dir.join(PAGE_FILE_NAME_PREFIX))?
             .into_iter()
             .map(|listed| (listed.path, listed.size))
             .collect();
 
+        let mut futs = Vec::new();
+
         // Reload pages
         for page in &self.pages {
-            page.live_preload(fs)?;
+            futs.push(page.live_preload(fs)?);
         }
 
         // Load new pages
@@ -288,13 +291,13 @@ impl<S: UniversalRead> AppendOnlyPages<S> {
             if !page_list.contains_key(&path) {
                 break;
             }
-            fs.schedule_prefetch(
+            fs.schedule_open(
                 &path,
                 Some(AppendOnlyPage::<S>::open_options(populate, false)),
                 None,
-            )?;
+            );
         }
-        Ok(())
+        Ok(futs)
     }
 }
 
@@ -494,23 +497,26 @@ impl<S: UniversalRead> AppendOnlyPage<S> {
             })
     }
 
-    fn live_preload<Fs: CachedReadFs<File = S>>(&self, fs: &Fs) -> Result<()> {
-        self.file
-            .schedule_reopen(|path| fs.cached_file_info(path))?;
-        Ok(())
+    fn live_preload<Fs: CachedReadFs<File = S>>(
+        &self,
+        fs: &Fs,
+    ) -> Result<Pin<Box<dyn Future<Output = ()> + Send + 'static>>> {
+        Ok(Box::pin(
+            self.file.live_preload(|path| fs.cached_file_info(path))?,
+        ))
     }
 
-    /// Reopen the page file handle and reload its length, making newly appended value data
+    /// Reload the page file handle and reload its length, making newly appended value data
     /// visible to reads and the reported storage size.
     ///
-    /// The reopen is a no-op for backends that read the file directly, those see newly appended
+    /// The reload is a no-op for backends that read the file directly, those see newly appended
     /// data without it.
     fn live_reload(&mut self) -> Result<()> {
         debug_assert!(
             self.pending.is_empty(),
             "live reload must only be used on read-only instances",
         );
-        self.file.reopen()?;
+        self.file.live_reload()?;
         self.persisted_len = self.file.len::<u8>()?;
         Ok(())
     }
@@ -590,7 +596,7 @@ impl<S: UniversalAppend> AppendOnlyPage<S> {
             // landed before; adopt them as persisted. Any other length means the file was
             // modified outside this writer.
             Err(UniversalIoError::AppendOffsetConflict { .. }) => {
-                self.file.reopen()?;
+                self.file.live_reload()?;
                 let len = self.file.len::<u8>()?;
                 if len != end {
                     return Err(BlobstoreError::service_error(format!(

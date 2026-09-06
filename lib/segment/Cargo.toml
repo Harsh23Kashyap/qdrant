@@ -47,6 +47,7 @@ pprof = { workspace = true }
 [dependencies]
 io_bridge_object_store = { path = "../common/io_bridge_object_store" }
 blink-alloc = { workspace = true }
+futures = { workspace = true }
 bytemuck = { workspace = true }
 data-encoding = { workspace = true }
 fs-err = { workspace = true }
@@ -70,7 +71,7 @@ atomicwrites = { workspace = true }
 memmap2 = { workspace = true }
 schemars = { workspace = true }
 log = { workspace = true }
-geo = "0.33.1"
+geo = { version = "0.33.1", default-features = false }
 geohash = "0.13.2"
 num-traits = { workspace = true }
 num-derive = "0.5.1"
@@ -91,6 +92,7 @@ sha2 = { workspace = true }
 siphasher = "1.0.3"
 smallvec = { workspace = true }
 strum = { workspace = true }
+tokio = { workspace = true }
 byteorder = { workspace = true }
 stumpalo = { workspace = true }
 zerocopy = { workspace = true }
@@ -121,10 +123,9 @@ macro_rules_attribute = "0.2.2"
 nom = "8.0.0"
 half = { workspace = true }
 roaring = { workspace = true }
-duplicate = "2.0.1"
+duplicate = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cgroups-rs = "0.5"
 procfs = { version = "0.18", default-features = false }
 
 [[bench]]
@@ -133,6 +134,10 @@ harness = false
 
 [[bench]]
 name = "turbo_vector_search"
+harness = false
+
+[[bench]]
+name = "turbo_full_scan"
 harness = false
 
 [[bench]]

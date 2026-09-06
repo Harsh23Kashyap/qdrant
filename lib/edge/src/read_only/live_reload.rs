@@ -2,9 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::universal_io::IsNotFound as _;
+use common::universal_io::{IsNotFound as _, UniversalReadFsAsync};
 use parking_lot::RwLock;
-use rayon::prelude::*;
 use segment::common::operation_error::{OperationError, OperationResult};
 use segment::index::UniversalReadExt;
 use segment::segment::read_only::ReadOnlySegment;
@@ -12,10 +11,10 @@ use uuid::Uuid;
 
 use crate::EdgeConfig;
 use crate::read_only::ReadOnlyEdgeShard;
-use crate::read_only::load::load_segments_parallel;
+use crate::read_only::load::{load_segments_parallel, reload_segments_parallel};
 
-/// How a single [`refresh_attempt`](ReadOnlyEdgeShard::refresh_attempt) ended.
-enum RefreshOutcome {
+/// How a single [`live_reload_attempt`](ReadOnlyEdgeShard::live_reload_attempt) ended.
+enum LiveReloadOutcome {
     /// The attempt fully converged on its manifest snapshot.
     Complete,
     /// Segments vanished benignly mid-attempt (the leader removed them, confirmed
@@ -25,34 +24,34 @@ enum RefreshOutcome {
 }
 
 impl<S: UniversalReadExt + 'static> ReadOnlyEdgeShard<S> {
-    /// Refresh the follower to the leader's current on-disk state.
+    /// Live-reload the follower to the leader's current on-disk state.
     ///
     /// Caller-driven (never self-triggered), mirroring `ReadOnlySegment::live_reload`: the host
     /// owns the cadence (a timer, an explicit call after a known leader flush, or an FS watch).
     /// Eventually consistent — a point becomes visible once the leader has flushed it to the
-    /// segment files and a subsequent `refresh` has run.
+    /// segment files and a subsequent `live_reload` has run.
     ///
     /// Leader-side segment churn is absorbed: a segment whose files vanish while its live-reload
     /// runs is checked against a re-read manifest, and if the leader indeed removed it, the segment
-    /// is dropped and the refresh re-runs (bounded) to pick up its replacements. `Err` therefore
+    /// is dropped and the live_reload re-runs (bounded) to pick up its replacements. `Err` therefore
     /// means the shard genuinely needs attention: a component failed to reload, or a segment's
     /// essential files are missing while the manifest still lists it. Either way the shard stays
-    /// consistent — every swap is atomic, a failed segment keeps serving its pre-refresh state,
-    /// and the next refresh replays its unapplied delta (see `pending_reload`).
-    pub fn refresh(&self) -> OperationResult<()>
+    /// consistent — every swap is atomic, a failed segment keeps serving its pre-live_reload state,
+    /// and the next live_reload replays its unapplied delta (see `pending_reload`).
+    pub fn live_reload(&self) -> OperationResult<()>
     where
-        S::Fs: Send + Sync + Clone + 'static,
+        S::Fs: UniversalReadFsAsync + Send + Sync + Clone + 'static,
     {
         let hw_counter = HardwareCounterCell::disposable();
-        self.refresh_with(&hw_counter)
+        self.live_reload_with(&hw_counter)
     }
 
-    /// [`refresh`](Self::refresh) with a caller-supplied hardware counter.
-    pub fn refresh_with(&self, hw_counter: &HardwareCounterCell) -> OperationResult<()>
+    /// [`live_reload`](Self::live_reload) with a caller-supplied hardware counter.
+    pub fn live_reload_with(&self, hw_counter: &HardwareCounterCell) -> OperationResult<()>
     where
-        S::Fs: Send + Sync + Clone + 'static,
+        S::Fs: UniversalReadFsAsync + Send + Sync + Clone + 'static,
     {
-        let _refresh_guard = self.refresh_lock.lock();
+        let _live_reload_guard = self.live_reload_lock.lock();
 
         // A benign mid-attempt segment removal re-runs the attempt against the fresh manifest;
         // bound the re-runs so a leader churning segments faster than the follower converges
@@ -60,33 +59,36 @@ impl<S: UniversalReadExt + 'static> ReadOnlyEdgeShard<S> {
         const MAX_ATTEMPTS: usize = 3;
 
         for _ in 0..MAX_ATTEMPTS {
-            match self.refresh_attempt(hw_counter)? {
-                RefreshOutcome::Complete => return Ok(()),
-                RefreshOutcome::ManifestChanged => {}
+            match self.live_reload_attempt(hw_counter)? {
+                LiveReloadOutcome::Complete => return Ok(()),
+                LiveReloadOutcome::ManifestChanged => {}
             }
         }
 
         // Attempts exhausted without converging. The shard is still consistent — every completed
-        // swap was atomic — it just may not reflect the newest segments yet; the next refresh
+        // swap was atomic — it just may not reflect the newest segments yet; the next live_reload
         // continues from here.
         log::warn!(
-            "shard refresh did not converge after {MAX_ATTEMPTS} attempts \
+            "shard live_reload did not converge after {MAX_ATTEMPTS} attempts \
              (leader keeps replacing segments); serving the state reached so far",
         );
         Ok(())
     }
 
-    /// One refresh pass over a single manifest snapshot.
+    /// One live_reload pass over a single manifest snapshot.
     ///
     /// Completes as much as possible before reporting problems: newly-appeared segments are
     /// swapped in and every survivor is live-reloaded (they are independent) even when one of
     /// them fails. Not-found failures are then resolved against a re-read manifest — a segment
-    /// the leader removed mid-attempt is dropped and reported as [`RefreshOutcome::ManifestChanged`]
+    /// the leader removed mid-attempt is dropped and reported as [`LiveReloadOutcome::ManifestChanged`]
     /// so the caller re-runs against the fresh manifest; one whose files are missing while the
     /// manifest still lists it escalates. Any other reload failure escalates after the loop.
-    fn refresh_attempt(&self, hw_counter: &HardwareCounterCell) -> OperationResult<RefreshOutcome>
+    fn live_reload_attempt(
+        &self,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<LiveReloadOutcome>
     where
-        S::Fs: Send + Sync + Clone + 'static,
+        S::Fs: UniversalReadFsAsync + Send + Sync + Clone + 'static,
     {
         // 1. Snapshot the current on-disk segment set (backend-specific; see `SegmentEnumerator`).
         let on_disk = self.enumerator.list_segments()?;
@@ -95,13 +97,13 @@ impl<S: UniversalReadExt + 'static> ReadOnlyEdgeShard<S> {
         //    add them and drop removed ones, and collect the survivors to live_reload *after*
         //    releasing the lock — so reads only block during the cheap add/drop, not during load
         //    or reload. The manifest is superset-biased, so unloadable segments are skipped by
-        //    `load_segments_parallel` and simply retried on the next refresh.
+        //    `load_segments_parallel` and simply retried on the next live_reload.
         let new_segments: Vec<(Uuid, PathBuf)> = {
             let holder = self.segments.read();
             on_disk
                 .iter()
                 .filter(|(uuid, _)| !holder.contains(uuid))
-                .map(|(uuid, segment_path)| (*uuid, segment_path.clone()))
+                .map(|(uuid, listing)| (*uuid, listing.path.clone()))
                 .collect()
         };
         let loaded = load_segments_parallel::<S>(
@@ -114,7 +116,7 @@ impl<S: UniversalReadExt + 'static> ReadOnlyEdgeShard<S> {
         let survivors: Vec<(Uuid, Arc<RwLock<ReadOnlySegment<S>>>)> = {
             let mut holder = self.segments.write();
 
-            // Segments present before this refresh that still exist on disk.
+            // Segments present before this live_reload that still exist on disk.
             let survivor_uuids: Vec<Uuid> = holder
                 .uuids()
                 .into_iter()
@@ -160,24 +162,12 @@ impl<S: UniversalReadExt + 'static> ReadOnlyEdgeShard<S> {
         }
 
         // 4. Live-reload survivors to assimilate new appends and deletes from data.
-        // Done in 2 steps: preload -> reload, so that we can avoid locking when prefetching.
-        self.search_pool.install(|| {
-            survivors.par_iter().for_each(|(uuid, segment)| {
-                let _ = segment.read().live_preload().inspect_err(|err| {
-                    log::warn!("live_preload of segment {uuid} failed: {err}");
-                });
-            });
-        });
+        let results = reload_segments_parallel(&self.search_pool, survivors, hw_counter);
 
         let mut not_found: Vec<(Uuid, OperationError)> = Vec::new();
         let mut first_hard_error: Option<OperationError> = None;
-
-        // TODO(uio): currently this locks each segment one at a time. Once we
-        // do `live_preload` async we'll have a clear signal of finishing
-        // prefetches to start locking. By then, we can also make this section a
-        // rayon par_iter, and take care of hw_counter not being thread-safe.
-        for (uuid, segment) in survivors {
-            match segment.write().live_reload(hw_counter) {
+        for (uuid, result) in results {
+            match result {
                 Ok(()) => {}
                 // An essential file is gone; whether that is benign (the leader removed the
                 // segment while we reloaded it) is decided against a re-read manifest below.
@@ -193,7 +183,7 @@ impl<S: UniversalReadExt + 'static> ReadOnlyEdgeShard<S> {
         //    the leader removed the segment mid-attempt — drop it and re-run to pick up its
         //    replacements; still listed means its essential files are genuinely missing — escalate.
         let outcome = if not_found.is_empty() {
-            RefreshOutcome::Complete
+            LiveReloadOutcome::Complete
         } else {
             let fresh = self.enumerator.list_segments()?;
             let mut gone: Vec<Uuid> = Vec::new();
@@ -205,7 +195,7 @@ impl<S: UniversalReadExt + 'static> ReadOnlyEdgeShard<S> {
                     );
                     still_listed_error.get_or_insert(err);
                 } else {
-                    log::debug!("segment {uuid} was removed by the leader during refresh");
+                    log::debug!("segment {uuid} was removed by the leader during live_reload");
                     gone.push(uuid);
                 }
             }
@@ -222,7 +212,7 @@ impl<S: UniversalReadExt + 'static> ReadOnlyEdgeShard<S> {
             if let Some(err) = still_listed_error {
                 return Err(err);
             }
-            RefreshOutcome::ManifestChanged
+            LiveReloadOutcome::ManifestChanged
         };
 
         if let Some(err) = first_hard_error {

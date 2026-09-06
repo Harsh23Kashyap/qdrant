@@ -6776,6 +6776,7 @@
             "description": "Size of a vectors used",
             "type": "integer",
             "format": "uint64",
+            "maximum": 65536,
             "minimum": 1
           },
           "distance": {
@@ -11933,6 +11934,7 @@
       "RunningEnvironmentTelemetry": {
         "type": "object",
         "required": [
+          "container_runtime",
           "cpu_flags",
           "is_docker"
         ],
@@ -11947,6 +11949,9 @@
           },
           "is_docker": {
             "type": "boolean"
+          },
+          "container_runtime": {
+            "$ref": "#/components/schemas/ContainerRuntime"
           },
           "cores": {
             "type": "integer",
@@ -11995,6 +12000,16 @@
             "nullable": true
           }
         }
+      },
+      "ContainerRuntime": {
+        "description": "Container runtime Qdrant is running under (`none` if bare metal).",
+        "type": "string",
+        "enum": [
+          "none",
+          "docker",
+          "kubernetes",
+          "other"
+        ]
       },
       "CpuEndian": {
         "type": "string",
@@ -12701,13 +12716,6 @@
             "enum": [
               "InRamMmap"
             ]
-          },
-          {
-            "description": "Placeholder storage: contains no data, all vectors reported as deleted. Used for newly created named vectors on immutable segments. No files on disk, reconstructed from config on load.",
-            "type": "string",
-            "enum": [
-              "Empty"
-            ]
           }
         ]
       },
@@ -12864,13 +12872,6 @@
             "type": "string",
             "enum": [
               "mmap"
-            ]
-          },
-          {
-            "description": "Placeholder storage: contains no data, all vectors reported as deleted. Used for newly created sparse named vectors on immutable segments.",
-            "type": "string",
-            "enum": [
-              "empty"
             ]
           }
         ]
@@ -15257,6 +15258,12 @@
             "$ref": "#/components/schemas/SumExpression"
           },
           {
+            "$ref": "#/components/schemas/MaxExpression"
+          },
+          {
+            "$ref": "#/components/schemas/MinExpression"
+          },
+          {
             "$ref": "#/components/schemas/NegExpression"
           },
           {
@@ -15364,6 +15371,36 @@
         ],
         "properties": {
           "sum": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Expression"
+            }
+          }
+        }
+      },
+      "MaxExpression": {
+        "description": "Largest of the given expressions. Requires at least one operand.",
+        "type": "object",
+        "required": [
+          "max"
+        ],
+        "properties": {
+          "max": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Expression"
+            }
+          }
+        }
+      },
+      "MinExpression": {
+        "description": "Smallest of the given expressions. Requires at least one operand.",
+        "type": "object",
+        "required": [
+          "min"
+        ],
+        "properties": {
+          "min": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/Expression"

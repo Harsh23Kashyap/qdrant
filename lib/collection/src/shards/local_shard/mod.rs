@@ -848,6 +848,16 @@ impl LocalShard {
         // operations, so a name that is created and used within the replay window stays valid.
         let mut valid_vector_names = self.collection_config.read().await.params.vector_names();
 
+        // Steer replayed copy-on-write moves with the same size cap live updates use, so replay
+        // picks the same class of destination. A deferred destination keeps the source point
+        // alive while a plain one deletes it, and a mismatch with what the live apply did could
+        // resurrect stale source data after recovery.
+        let max_segment_size_bytes = self
+            .optimizers
+            .load()
+            .first()
+            .and_then(|optimizer| optimizer.threshold_config().max_segment_size_bytes());
+
         for entry in wal.read_range(from..to) {
             let (op_num, mut update) = entry.map_err(|e| {
                 CollectionError::service_error(format!(
@@ -879,6 +889,7 @@ impl LocalShard {
                 update.operation,
                 self.update_operation_lock.clone(),
                 self.update_tracker.clone(),
+                max_segment_size_bytes,
                 &HardwareCounterCell::disposable(), // Internal operation, no measurement needed.
             ) {
                 Err(err @ CollectionError::ServiceError { error, backtrace }) => {
@@ -1189,8 +1200,7 @@ impl LocalShard {
                 // TODO: snapshotting also creates temp proxy segments. should differentiate.
                 let has_special_segment = segments
                     .iter()
-                    // `size_info` carries `segment_type` and cannot fail.
-                    .map(|(_, segment)| segment.get().read().size_info().segment_type)
+                    .map(|(_, segment)| segment.get().read().segment_type())
                     .any(|segment_type| segment_type == SegmentType::Special);
                 if has_special_segment {
                     Some((ShardStatus::Yellow, OptimizersStatus::Ok))
@@ -1231,15 +1241,21 @@ impl LocalShard {
     pub async fn memory_report(&self) -> CollectionResult<CollectionMemoryReport> {
         let segments = self.segments.clone();
         tokio::task::spawn_blocking(move || {
-            let segments_read = segments.read();
-            let mut reports = Vec::new();
+            // Collect metadata while the segments are stable, then release all
+            // segment locks before issuing page-cache probes.
+            let segment_reports = {
+                let segments_read = segments.read();
+                let mut reports = Vec::new();
+                for (_id, locked_segment) in segments_read.iter() {
+                    collect_segment_memory_metadata(locked_segment, &mut reports);
+                }
+                reports
+            };
 
-            // Collect from all segments, including those wrapped in proxies.
-            // During optimization, original segments become proxy-wrapped while
-            // a new empty segment is built. We must report from both.
-            for (_id, locked_segment) in segments_read.iter() {
-                collect_memory_reports(locked_segment, &mut reports)?;
-            }
+            let reports = segment_reports
+                .into_iter()
+                .map(crate::common::memory_reporter::report_from_segment)
+                .collect::<CollectionResult<Vec<_>>>()?;
 
             Ok(CollectionMemoryReport::merge_all(reports))
         })
@@ -1684,27 +1700,23 @@ fn desired_vector_names_from_config(
     desired
 }
 
-/// Recursively collect memory reports from a `LockedSegment`.
+/// Recursively collect memory metadata from a `LockedSegment`.
 ///
 /// For `Original` segments, collects directly.
 /// For `Proxy` segments, collects from the wrapped segment
 /// (which is the real data holder during optimization).
-fn collect_memory_reports(
+fn collect_segment_memory_metadata(
     locked_segment: &LockedSegment,
-    reports: &mut Vec<CollectionMemoryReport>,
-) -> CollectionResult<()> {
+    reports: &mut Vec<segment::segment::memory::SegmentMemoryReport>,
+) {
     match locked_segment {
         LockedSegment::Original(segment) => {
             let segment_guard = segment.read();
-            let seg_report = segment_guard.memory_report();
-            reports.push(crate::common::memory_reporter::report_from_segment(
-                seg_report,
-            )?);
+            reports.push(segment_guard.memory_report());
         }
         LockedSegment::Proxy(proxy) => {
             let proxy_guard = proxy.read();
-            collect_memory_reports(&proxy_guard.wrapped_segment, reports)?;
+            collect_segment_memory_metadata(&proxy_guard.wrapped_segment, reports);
         }
     }
-    Ok(())
 }

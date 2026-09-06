@@ -23,6 +23,59 @@ impl AliasMapping {
     pub fn save(&self, path: &Path) -> Result<(), StorageError> {
         Ok(atomic_save_json(path, self)?)
     }
+
+    /// Aliases pointing at `collection_name`.
+    pub fn collection_aliases<'a>(
+        &'a self,
+        collection_name: &'a str,
+    ) -> impl Iterator<Item = Alias> + 'a {
+        self.0
+            .iter()
+            .filter(move |&(_, target)| target == collection_name)
+            .map(|(alias, _)| alias.clone())
+    }
+
+    /// Iterate over aliases and collections they point at.
+    pub fn iter(&self) -> impl Iterator<Item = (&Alias, &CollectionId)> {
+        self.0.iter()
+    }
+
+    /// Returns collection `alias` points at, or `None` if it does not exist.
+    pub fn get(&self, alias: &str) -> Option<&CollectionId> {
+        self.0.get(alias)
+    }
+
+    /// Point `alias` at `collection_name`, replacing collection it pointed at before.
+    pub fn insert(&mut self, alias: Alias, collection_name: CollectionId) {
+        self.0.insert(alias, collection_name);
+    }
+
+    /// Drop `alias`, if it exists.
+    pub fn remove(&mut self, alias: &str) {
+        self.0.remove(alias);
+    }
+
+    /// Drop every alias pointing at `collection_name`.
+    /// Returns `false` if there were none.
+    pub fn remove_collection(&mut self, collection_name: &str) -> bool {
+        let len = self.0.len();
+
+        self.0.retain(|_, target| target != collection_name);
+
+        self.0.len() != len
+    }
+
+    /// Rename `old_alias` as `new_alias`, keeping collection it points at.
+    /// Returns `false` if `old_alias` does not exist.
+    pub fn rename(&mut self, old_alias: &str, new_alias: Alias) -> bool {
+        let Some(collection_name) = self.0.remove(old_alias) else {
+            return false;
+        };
+
+        self.0.insert(new_alias, collection_name);
+
+        true
+    }
 }
 
 /// Persists mapping between alias and collection name. The data is assumed to be relatively small.
@@ -60,65 +113,28 @@ impl AliasPersistence {
     }
 
     pub fn get(&self, alias: &str) -> Option<String> {
-        self.alias_mapping.0.get(alias).cloned()
+        self.alias_mapping.get(alias).cloned()
     }
 
     pub fn insert(&mut self, alias: String, collection_name: String) -> Result<(), StorageError> {
-        self.alias_mapping.0.insert(alias, collection_name);
+        self.alias_mapping.insert(alias, collection_name);
         self.alias_mapping.save(&self.data_path)?;
         Ok(())
     }
 
-    pub fn remove(&mut self, alias: &str) -> Result<Option<String>, StorageError> {
-        let output = self.alias_mapping.0.remove(alias);
-
-        if output.is_some() {
-            self.alias_mapping.save(&self.data_path)?;
-        }
-
-        Ok(output)
-    }
-
     /// Removes all aliases for a given collection.
     pub fn remove_collection(&mut self, collection_name: &str) -> Result<(), StorageError> {
-        let prev_len = self.alias_mapping.0.len();
-
-        self.alias_mapping.0.retain(|_, v| v != collection_name);
-
-        if prev_len != self.alias_mapping.0.len() {
+        if self.alias_mapping.remove_collection(collection_name) {
             self.alias_mapping.save(&self.data_path)?;
         }
 
         Ok(())
     }
 
-    pub fn rename_alias(
-        &mut self,
-        old_alias_name: &str,
-        new_alias_name: String,
-    ) -> Result<(), StorageError> {
-        match self.get(old_alias_name) {
-            None => Err(StorageError::not_found(format!(
-                "Alias {old_alias_name} does not exists!"
-            ))),
-            Some(collection_name) => {
-                self.alias_mapping.0.remove(old_alias_name);
-                self.alias_mapping.0.insert(new_alias_name, collection_name);
-                // 'remove' & 'insert' saved atomically
-                self.alias_mapping.save(&self.data_path)?;
-                Ok(())
-            }
-        }
-    }
-
     pub fn collection_aliases(&self, collection_name: &str) -> Vec<String> {
-        let mut result = vec![];
-        for (alias, target_collection) in self.alias_mapping.0.iter() {
-            if collection_name == target_collection {
-                result.push(alias.clone());
-            }
-        }
-        result
+        self.alias_mapping
+            .collection_aliases(collection_name)
+            .collect()
     }
 
     pub fn state(&self) -> &AliasMapping {
@@ -132,6 +148,6 @@ impl AliasPersistence {
     }
 
     pub fn check_alias_exists(&self, alias: &str) -> bool {
-        self.alias_mapping.0.contains_key(alias)
+        self.alias_mapping.get(alias).is_some()
     }
 }

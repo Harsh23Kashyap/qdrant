@@ -26,7 +26,7 @@ fn storage_type_params(storage_type: VectorStorageType) -> Option<(AdviceSetting
         VectorStorageType::InRamMmap => (AdviceSetting::from(Advice::Normal), true, false),
         VectorStorageType::ChunkedMmap => (AdviceSetting::Global, false, true),
         VectorStorageType::InRamChunkedMmap => (AdviceSetting::from(Advice::Normal), true, true),
-        VectorStorageType::Memory | VectorStorageType::Empty => return None,
+        VectorStorageType::Memory => return None,
     };
 
     let populate = match populate {
@@ -52,6 +52,7 @@ impl<S: UniversalRead> VectorStorageReadEnum<S> {
         fs: &impl CachedReadFs<File = S>,
         vector_config: &VectorDataConfig,
         path: &Path,
+        _vector_index_path: &Path,
         populate_override: Option<Populate>,
     ) -> OperationResult<()> {
         let datatype = vector_config.datatype.unwrap_or_default();
@@ -137,6 +138,7 @@ impl<S: UniversalRead> VectorStorageReadEnum<S> {
         fs: &impl UniversalReadFs<File = S>,
         vector_config: &VectorDataConfig,
         path: &Path,
+        _vector_index_path: &Path,
         populate_override: Option<Populate>,
     ) -> OperationResult<Option<Self>> {
         let dim = vector_config.size;

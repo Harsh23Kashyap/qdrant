@@ -14,9 +14,11 @@ use common::fs::safe_delete_in_tmp;
 
 use super::{COLLECTION_DELETE_SPIN_INTERVAL, COLLECTION_DELETE_WAIT_TIMEOUT, TableOfContent};
 use crate::common::utils::try_unwrap_with_timeout_async;
+use crate::content_manager::alias_mapping::AliasMapping;
 use crate::content_manager::collection_meta_ops::*;
 use crate::content_manager::collections_ops::Checker as _;
 use crate::content_manager::consensus_ops::ConsensusOperations;
+use crate::content_manager::consensus_state_machine::apply_collection_config_diffs;
 use crate::content_manager::errors::StorageError;
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
 
@@ -154,6 +156,21 @@ impl TableOfContent {
         mut operation: UpdateCollectionOperation,
     ) -> Result<bool, StorageError> {
         let replica_changes = operation.take_shard_replica_changes();
+        let collection = self
+            .get_collection_unchecked(&operation.collection_name)
+            .await?;
+
+        // Check every diff against a copy of the config first. A diff rejected in the middle of
+        // the operation must not keep the diffs saved before it.
+        //
+        // `ClusterState::plan_update_collection` checks an operation with the same call, so both
+        // reject the same ones. Once the state machine drives consensus, this call is the only
+        // thing checking a diff on this path, and it goes with the code below it.
+        apply_collection_config_diffs(
+            &mut collection.config().await,
+            &operation.update_collection,
+        )?;
+
         let UpdateCollection {
             vectors,
             hnsw_config,
@@ -164,9 +181,6 @@ impl TableOfContent {
             strict_mode_config: strict_mode,
             metadata,
         } = operation.update_collection;
-        let collection = self
-            .get_collection_unchecked(&operation.collection_name)
-            .await?;
         let mut recreate_optimizers = false;
 
         if let Some(diff) = optimizers_config {
@@ -317,36 +331,19 @@ impl TableOfContent {
         // Prevent search on partially switched collections
         let collection_lock = self.collections.write().await;
         let mut alias_lock = self.alias_persistence.write().await;
-        for action in operation.actions {
-            match action {
-                AliasOperations::CreateAlias(CreateAliasOperation {
-                    create_alias:
-                        CreateAlias {
-                            collection_name,
-                            alias_name,
-                        },
-                }) => {
-                    collection_lock.validate_collection_exists(&collection_name)?;
-                    collection_lock.validate_collection_not_exists(&alias_name)?;
 
-                    alias_lock.insert(alias_name, collection_name)?;
-                }
-                AliasOperations::DeleteAlias(DeleteAliasOperation {
-                    delete_alias: DeleteAlias { alias_name },
-                }) => {
-                    alias_lock.remove(&alias_name)?;
-                }
-                AliasOperations::RenameAlias(RenameAliasOperation {
-                    rename_alias:
-                        RenameAlias {
-                            old_alias_name,
-                            new_alias_name,
-                        },
-                }) => {
-                    alias_lock.rename_alias(&old_alias_name, new_alias_name)?;
-                }
-            };
-        }
+        // Validate and apply `actions` to a copy of the mapping, and save it once at the end.
+        //
+        // Rejecting an action in the middle of the list must not keep the actions before it,
+        // so nothing is persisted until every action is validated.
+        let mut aliases = alias_lock.state().clone();
+
+        apply_alias_actions(&mut aliases, &operation.actions, |collection_name| {
+            collection_lock.collection_exists(collection_name)
+        })?;
+
+        alias_lock.apply_state(aliases)?;
+
         Ok(true)
     }
 
@@ -532,16 +529,17 @@ impl TableOfContent {
                     .await?;
             }
             ShardTransferOperations::Restart(transfer_restart) => {
-                let transfers: HashSet<transfer::ShardTransfer> =
-                    collection.state().await.transfers;
-
                 let transfer_key = transfer_restart.key();
 
                 // The record must exist. A restart updates the record in place, never
                 // removing it, so a missing record means a stale duplicate restart —
                 // reject it. A restart to an unchanged method is not rejected here; it
                 // is an idempotent no-op inside `restart_shard_transfer`.
-                let Some(old_transfer) = transfer::helpers::get_transfer(&transfer_key, &transfers)
+                let Some(old_transfer) = collection
+                    .shards_holder()
+                    .read()
+                    .await
+                    .get_transfer(&transfer_key)
                 else {
                     return Err(StorageError::bad_request(format!(
                         "There is no transfer for shard {} from {} to {}",
@@ -614,30 +612,23 @@ impl TableOfContent {
             }
             ShardTransferOperations::Finish(transfer) => {
                 // Validate transfer exists to prevent double handling
-                transfer::helpers::validate_transfer_exists(
-                    &transfer.key(),
-                    &collection.state().await.transfers,
-                )?;
+                collection.validate_transfer_exists(&transfer.key()).await?;
 
                 collection.finish_shard_transfer(transfer, None).await?;
             }
             ShardTransferOperations::RecoveryToPartial(transfer)
             | ShardTransferOperations::SnapshotRecovered(transfer) => {
                 // Validate transfer exists
-                transfer::helpers::validate_transfer_exists(
-                    &transfer,
-                    &collection.state().await.transfers,
-                )?;
+                collection.validate_transfer_exists(&transfer).await?;
 
                 let collection = self.get_collection_unchecked(&collection_id).await?;
 
                 let current_state = collection
-                    .state()
+                    .shards_holder()
+                    .read()
                     .await
-                    .shards
-                    .get(&transfer.shard_id)
-                    .and_then(|info| info.replicas.get(&transfer.to))
-                    .copied();
+                    .get_shard(transfer.shard_id)
+                    .and_then(|replica_set| replica_set.peer_state(transfer.to));
 
                 let Some(current_state) = current_state else {
                     return Err(StorageError::bad_input(format!(
@@ -684,10 +675,7 @@ impl TableOfContent {
             }
             ShardTransferOperations::Abort { transfer, reason } => {
                 // Validate transfer exists to prevent double handling
-                transfer::helpers::validate_transfer_exists(
-                    &transfer,
-                    &collection.state().await.transfers,
-                )?;
+                collection.validate_transfer_exists(&transfer).await?;
                 log::warn!("Aborting shard transfer: {reason}");
                 collection
                     .abort_shard_transfer_and_resharding(transfer)
@@ -803,4 +791,68 @@ impl TableOfContent {
 
         Ok(())
     }
+}
+
+/// Apply `actions` to `aliases`, validating each one against `collection_exists`.
+///
+/// Returns on the first invalid action, leaving `aliases` partially updated. `update_aliases`
+/// works on a copy it only saves on success, so a rejected operation changes nothing.
+///
+/// `ClusterState::plan_change_aliases` calls this as well, so that both accept and reject the
+/// same operations. Inline it back here once the state machine drives consensus and this is the
+/// only caller.
+pub(crate) fn apply_alias_actions(
+    aliases: &mut AliasMapping,
+    actions: &[AliasOperations],
+    collection_exists: impl Fn(&str) -> bool,
+) -> Result<(), StorageError> {
+    for action in actions {
+        match action {
+            AliasOperations::CreateAlias(CreateAliasOperation {
+                create_alias:
+                    CreateAlias {
+                        collection_name,
+                        alias_name,
+                    },
+            }) => {
+                // `collection_name` must name a collection, not an alias
+                if !collection_exists(collection_name) {
+                    return Err(StorageError::not_found(format!(
+                        "Collection `{collection_name}` does not exist"
+                    )));
+                }
+
+                if collection_exists(alias_name) {
+                    return Err(StorageError::already_exists(format!(
+                        "Collection `{alias_name}` already exists"
+                    )));
+                }
+
+                aliases.insert(alias_name.clone(), collection_name.clone());
+            }
+
+            AliasOperations::DeleteAlias(DeleteAliasOperation {
+                delete_alias: DeleteAlias { alias_name },
+            }) => {
+                // Deleting an alias that does not exist is a no-op, not an error
+                aliases.remove(alias_name);
+            }
+
+            AliasOperations::RenameAlias(RenameAliasOperation {
+                rename_alias:
+                    RenameAlias {
+                        old_alias_name,
+                        new_alias_name,
+                    },
+            }) => {
+                if !aliases.rename(old_alias_name, new_alias_name.clone()) {
+                    return Err(StorageError::not_found(format!(
+                        "Alias {old_alias_name} does not exist"
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

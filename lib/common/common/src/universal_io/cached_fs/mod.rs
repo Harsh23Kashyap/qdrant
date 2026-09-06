@@ -2,14 +2,20 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::task::Poll;
 
+use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
 use parking_lot::Mutex;
+
+mod async_io;
 
 use crate::mmap::AdviceSetting;
 use crate::universal_io::traits::CachedReadFs;
 use crate::universal_io::{
     ListedFile, OpenExtra, OpenOptions, Populate, UioResult, UniversalIoError,
-    UniversalReadFileOps, UniversalReadFs,
+    UniversalReadFileOps, UniversalReadFs, UniversalReadFsAsync,
 };
 
 #[derive(Clone, Debug)]
@@ -71,7 +77,11 @@ impl FileInfo {
 /// Prefetched handles are take-once: [`UniversalReadFs::open`] removes the
 /// handle from the pool and returns it owned. The pool is shared across
 /// clones.
-pub struct CachedFs<Fs: UniversalReadFs> {
+pub struct CachedFs<Fs>
+where
+    Fs: UniversalReadFs,
+    Fs::File: 'static,
+{
     fs: Fs,
     prefix_path: PathBuf,
     /// `None` until [`CachedFs::cache_file_info`] takes the listing
@@ -79,7 +89,23 @@ pub struct CachedFs<Fs: UniversalReadFs> {
     files_info: Option<HashMap<PathBuf, FileInfo>>,
     /// Previous listing snapshot.
     previous_files_info: Option<HashMap<PathBuf, FileInfo>>,
-    files_prefetched: Arc<Mutex<HashMap<PathBuf, Option<Fs::File>>>>,
+    files_prefetched: Arc<Mutex<HashMap<PathBuf, ScheduledFile<Fs::File>>>>,
+}
+
+enum ScheduledFile<S: 'static> {
+    Future(BoxFuture<'static, UioResult<S>>),
+    Ready(UioResult<S>),
+    Unchanged,
+}
+
+impl<S> Debug for ScheduledFile<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScheduledFile::Future(_) => write!(f, "Future"),
+            ScheduledFile::Ready(_) => write!(f, "Ready"),
+            ScheduledFile::Unchanged => write!(f, "Unchanged"),
+        }
+    }
 }
 
 /// Manual impl: `derive(Clone)` would add a spurious `Fs::File: Clone`
@@ -174,7 +200,11 @@ impl<Fs: UniversalReadFs> CachedFs<Fs> {
     }
 }
 
-impl<Fs: UniversalReadFs> CachedReadFs for CachedFs<Fs> {
+/// The one impl with the `UniversalReadFsAsync` bound: `schedule_open` /
+/// `reschedule_open` park the inner filesystem's `open_async` futures in the
+/// prefetch pool. Everything else on `CachedFs` (including consuming parked
+/// futures in `open`) works over a plain `UniversalReadFs`.
+impl<Fs: UniversalReadFsAsync> CachedReadFs for CachedFs<Fs> {
     /// Take a LIST snapshot of the filesystem and drop prefetched files.
     fn cache_file_info(&mut self) -> UioResult<()> {
         // List all files
@@ -210,16 +240,16 @@ impl<Fs: UniversalReadFs> CachedReadFs for CachedFs<Fs> {
         self.files_prefetched.lock().clear();
     }
 
-    fn schedule_prefetch(
+    fn schedule_open(
         &self,
         path: &Path,
         open_arguments: Option<OpenOptions>,
         open_extra: Option<Fs::OpenExtra>,
-    ) -> UioResult<()> {
+    ) {
         let mut files_prefetched = self.files_prefetched.lock();
 
         if files_prefetched.contains_key(path) {
-            return Ok(());
+            return;
         }
 
         let open_options = open_arguments.unwrap_or(OpenOptions {
@@ -230,42 +260,86 @@ impl<Fs: UniversalReadFs> CachedReadFs for CachedFs<Fs> {
         });
 
         let mut open_extra = open_extra.unwrap_or_default();
-        if let Some(info) = self.file_info(path) {
+        if let Some(info) = self.files_info.as_ref() {
+            let Some(info) = info.get(path) else {
+                // The file was not listed, set NotFound eagerly.
+                files_prefetched.insert(
+                    path.to_path_buf(),
+                    ScheduledFile::Ready(Err(UniversalIoError::NotFound {
+                        path: path.to_path_buf(),
+                    })),
+                );
+                return;
+            };
+
             open_extra = open_extra.with_known_len(info.size);
         }
 
-        let file = self.fs.open(path, open_options, open_extra)?;
-        files_prefetched.insert(path.to_path_buf(), Some(file));
+        // Clone the fs handle so that the future can own it.
+        let fs = self.fs.clone();
+        let path_owned = path.to_path_buf();
+        let mut fut =
+            Box::pin(async move { fs.open_async(path_owned, open_options, open_extra).await });
 
-        Ok(())
+        // Poll once, so that real async work begins right away
+        let scheduled = futures::executor::block_on(async move {
+            match futures::poll!(fut.as_mut()) {
+                Poll::Ready(file) => ScheduledFile::Ready(file),
+                Poll::Pending => ScheduledFile::Future(fut),
+            }
+        });
+        files_prefetched.insert(path.to_path_buf(), scheduled);
     }
 
-    fn reschedule_prefetch(
+    // TODO(uio): merge into `schedule_open`? might make it simpler to use
+    fn reschedule_open(
         &self,
         path: &Path,
         open_arguments: Option<OpenOptions>,
         open_extra: Option<Fs::OpenExtra>,
-    ) -> UioResult<()> {
+    ) {
+        // Check if their file info is complete and didn't change.
+        if self
+            .previous_file_info(path)
+            .zip(self.file_info(path))
+            .is_some_and(|(previous, current)| previous.full_eq(current))
         {
-            let mut files_prefetched = self.files_prefetched.lock();
-
-            if files_prefetched.contains_key(path) {
-                return Ok(());
-            }
-
-            // Check if their file info is complete and didn't change.
-            if self
-                .previous_file_info(path)
-                .zip(self.file_info(path))
-                .is_some_and(|(previous, current)| previous.full_eq(current))
-            {
-                files_prefetched.insert(path.to_path_buf(), None);
-                return Ok(());
-            }
+            self.files_prefetched
+                .lock()
+                .entry(path.to_path_buf())
+                .or_insert(ScheduledFile::Unchanged);
+            return;
         }
 
         // Otherwise schedule normally
-        self.schedule_prefetch(path, open_arguments, open_extra)
+        self.schedule_open(path, open_arguments, open_extra)
+    }
+
+    fn schedule(&self, path: PathBuf, fut: BoxFuture<'static, UioResult<Fs::File>>) {
+        self.files_prefetched
+            .lock()
+            .insert(path, ScheduledFile::Future(fut));
+    }
+
+    fn wait_all(&self) -> impl Future<Output = ()> + Send + 'static + use<Fs> {
+        let files_prefetched = Arc::clone(&self.files_prefetched);
+
+        let futs = files_prefetched
+            .lock()
+            .extract_if(|_path, scheduled| matches!(scheduled, ScheduledFile::Future(_)))
+            .filter_map(|(path, scheduled)| match scheduled {
+                ScheduledFile::Future(fut) => Some(async move { (path, fut.await) }),
+                ScheduledFile::Ready(_) | ScheduledFile::Unchanged => None,
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        async move {
+            let results = futs.collect::<Vec<_>>().await;
+            let mut lock = files_prefetched.lock();
+            for (path, result) in results {
+                lock.insert(path, ScheduledFile::Ready(result));
+            }
+        }
     }
 
     fn cached_file_info(&self, path: &Path) -> Option<FileInfo> {
@@ -348,8 +422,9 @@ impl<Fs: UniversalReadFs> UniversalReadFs for CachedFs<Fs> {
 
         if let Some(file) = self.files_prefetched.lock().remove(path) {
             return match file {
-                Some(file) => Ok(file),
-                None => Err(UniversalIoError::UnchangedOpen {
+                ScheduledFile::Future(future) => futures::executor::block_on(future),
+                ScheduledFile::Ready(result) => result,
+                ScheduledFile::Unchanged => Err(UniversalIoError::UnchangedOpen {
                     path: path.to_owned(),
                     since: self.file_info(path).and_then(|info| info.last_modified),
                 }),

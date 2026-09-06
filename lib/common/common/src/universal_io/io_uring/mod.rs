@@ -170,6 +170,11 @@ impl UniversalReadFs for IoUringFs {
     }
 }
 
+// Deliberately no `UniversalReadFsAsync`/`UniversalReadAsync` impls: io_uring
+// is not used as a read-only-segment backend, and its previous async surface
+// (a dedicated `tokio_uring` bridge thread) was a stopgap. A real async path,
+// if ever needed, belongs on the submission pool.
+
 impl UniversalRead for IoUringFile {
     type Fs = IoUringFs;
 
@@ -179,7 +184,7 @@ impl UniversalRead for IoUringFile {
         Self: 'a,
         U: UserData;
 
-    fn reopen(&mut self) -> UioResult<()> {
+    fn live_reload(&mut self) -> UioResult<()> {
         Ok(())
     }
 

@@ -160,13 +160,26 @@ impl<S: UniversalWrite> BitmaskGaps<S> {
 
         create_and_ensure_length(&self.path, new_length_in_bytes)?;
 
-        self.slice_store.reopen()?;
+        self.slice_store.live_reload()?;
 
         debug_assert_eq!(self.len()? - prev_len, data.len());
 
         let byte_offset = (prev_len * size_of::<RegionGaps>()) as u64;
         self.slice_store.write(byte_offset, &data)?;
 
+        Ok(())
+    }
+
+    /// Overwrite all entries in place.
+    ///
+    /// `data` must hold exactly the current number of entries: the file is not resized, since
+    /// that would require unmapping it first (Windows refuses to resize a file with a live
+    /// mapping). A length divergence is repaired with a full file replacement instead, see
+    /// `Bitmask::into_rebuilt_gaps`.
+    pub fn overwrite(&mut self, data: &[RegionGaps]) -> Result<()> {
+        debug_assert_eq!(self.len()?, data.len(), "overwrite cannot resize");
+
+        self.slice_store.write(0, data)?;
         Ok(())
     }
 

@@ -1,5 +1,7 @@
 use std::fmt::Debug;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use futures::future::BoxFuture;
 
 use crate::universal_io::cached_fs::FileInfo;
 use crate::universal_io::traits::append::UniversalAppend;
@@ -21,10 +23,11 @@ use crate::universal_io::{ListedFile, OpenOptions, UioResult};
 /// [`UniversalWriteFileOps`] subtrait.
 ///
 /// Handles are cheap to clone and shareable across threads, e.g. to move
-/// them into background flushers.
+/// them into background flushers. They own their resources (`'static`), so
+/// futures built from a cloned handle can be parked or spawned.
 ///
 /// [`UniversalWrite`]: super::UniversalWrite
-pub trait UniversalReadFileOps: Clone + Debug + Send + Sync + Sized {
+pub trait UniversalReadFileOps: Clone + Debug + Send + Sync + Sized + 'static {
     /// Implementation-specific construction config. Backends are free to
     /// require explicit construction; callers that want to opt into the
     /// `<Fs::ContextConfig>::default()` pattern must constrain
@@ -134,7 +137,7 @@ pub trait UniversalReadFs: UniversalReadFileOps {
     /// here. Generic callers pass `Default::default()` and chain
     /// [`OpenExtra`] setters (e.g. [`OpenExtra::with_prevent_caching`]) for
     /// behaviors that have universal meaning across backends.
-    type OpenExtra: OpenExtra;
+    type OpenExtra: OpenExtra + Send;
 
     /// Open a file for reading.
     ///
@@ -166,23 +169,32 @@ pub trait CachedReadFs: UniversalReadFs {
     /// Open `path` in the background and park the handle in the prefetch
     /// pool, to be consumed by a later [`UniversalReadFs::open`] of the same
     /// path. Idempotent per path while the handle is unconsumed.
-    fn schedule_prefetch(
+    fn schedule_open(
         &self,
         path: &Path,
         open_arguments: Option<OpenOptions>,
         open_extra: Option<Self::OpenExtra>,
-    ) -> UioResult<()>;
+    );
 
     /// Schedule a prefetch for a file that has been opened already.
     ///
     /// This will force `Self::open` to return `UnchangedOpen` error if the file
     /// did not change its `FileInfo` in between snapshots.
-    fn reschedule_prefetch(
+    fn reschedule_open(
         &self,
         path: &Path,
         open_arguments: Option<OpenOptions>,
         open_extra: Option<Self::OpenExtra>,
-    ) -> UioResult<()>;
+    );
+
+    /// Granular version of `schedule_open` for custom `populate` cases
+    fn schedule(&self, path: PathBuf, fut: BoxFuture<'static, UioResult<Self::File>>);
+
+    /// Wait for all scheduled files to resolve.
+    ///
+    /// The future is detached (`use<Self>`: no lifetime capture), so it can be
+    /// driven after the `&self` borrow ends.
+    fn wait_all(&self) -> impl Future<Output = ()> + Send + 'static + use<Self>;
 
     /// Return the file info from the current snapshot.
     fn cached_file_info(&self, path: &Path) -> Option<FileInfo>;

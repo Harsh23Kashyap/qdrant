@@ -23,6 +23,7 @@ use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::VectorRef;
 use crate::types::{Distance, Memory, VectorStorageDatatype};
+use crate::vector_storage::common::error_immutable_insert;
 use crate::vector_storage::dense::immutable_dense_vectors::ImmutableDenseVectors;
 use crate::vector_storage::{
     DenseVectorStorage, DenseVectorStorageRead, VectorStorage, VectorStorageEnum, VectorStorageRead,
@@ -445,7 +446,7 @@ where
         _vector: VectorRef,
         _hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
-        panic!("Can't directly update vector in mmap storage")
+        Err(error_immutable_insert())
     }
 
     fn flusher(&self) -> Flusher {
@@ -702,8 +703,11 @@ mod tests {
             .exactly_one()
             .unwrap();
         assert_eq!(closest.len(), 2, "must have 2 vectors, 3 are deleted");
-        assert_eq!(closest[0].idx, 4);
-        assert_eq!(closest[1].idx, 0);
+        // Points 0 and 4 both score 1.0 against this query; order among equal
+        // scores is unspecified, so assert the set rather than positions.
+        let mut ids = closest.iter().map(|p| p.idx).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, [0, 4]);
 
         // Delete all
         storage.delete_vector(0 as PointOffsetType).unwrap();

@@ -1,5 +1,6 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use common::generic_consts::{AccessPattern, Random};
 use common::mmap::{Advice, AdviceSetting};
@@ -69,17 +70,12 @@ impl<S: UniversalRead> AppendOnlyTracker<S> {
 
     /// Schedule a prefetch of the tracker file, so a subsequent open is served from the prefetch
     /// pool.
-    pub fn preopen<Fs: CachedReadFs<File = S>>(
-        fs: &Fs,
-        dir: &Path,
-        populate: Populate,
-    ) -> Result<()> {
-        fs.schedule_prefetch(
+    pub fn preopen<Fs: CachedReadFs<File = S>>(fs: &Fs, dir: &Path, populate: Populate) {
+        fs.schedule_open(
             &Self::tracker_file_name(dir),
             Some(Self::open_options(populate, false)),
             None,
-        )?;
-        Ok(())
+        );
     }
 
     /// Open the tracker file handle, mapping a missing file to a service error.
@@ -251,7 +247,7 @@ impl<S: UniversalRead> AppendOnlyTracker<S> {
             "live reload must only be used on read-only instances",
         );
 
-        self.file.reopen()?;
+        self.file.live_reload()?;
         let len = self.file.len::<u8>()?;
         let new_count = count_from_len(len)?;
 
@@ -278,10 +274,13 @@ impl<S: UniversalRead> AppendOnlyTracker<S> {
         self.persisted_count = count;
     }
 
-    pub(crate) fn live_preload<Fs: CachedReadFs<File = S>>(&self, fs: &Fs) -> Result<()> {
-        self.file
-            .schedule_reopen(|path| fs.cached_file_info(path))?;
-        Ok(())
+    pub(crate) fn live_preload<Fs: CachedReadFs<File = S>>(
+        &self,
+        fs: &Fs,
+    ) -> Result<Pin<Box<dyn Future<Output = ()> + Send + 'static>>> {
+        Ok(Box::pin(
+            self.file.live_preload(|path| fs.cached_file_info(path))?,
+        ))
     }
 }
 
@@ -416,7 +415,7 @@ impl<S: UniversalAppend> AppendOnlyTracker<S> {
             // landed before; adopt them as persisted. Any other length means the file was
             // modified outside this writer.
             Err(UniversalIoError::AppendOffsetConflict { .. }) => {
-                self.file.reopen()?;
+                self.file.live_reload()?;
                 let len = self.file.len::<u8>()?;
                 if len != end {
                     return Err(BlobstoreError::service_error(format!(
@@ -878,7 +877,6 @@ mod tests {
             vec![Some(pointer(2)), Some(pointer(3)),]
         );
         assert_eq!(tracker.get_range::<Random>(7..9).unwrap(), vec![None, None]);
-        #[allow(clippy::reversed_empty_ranges)]
         let empty = tracker.get_range::<Random>(3..3).unwrap();
         assert!(empty.is_empty());
     }

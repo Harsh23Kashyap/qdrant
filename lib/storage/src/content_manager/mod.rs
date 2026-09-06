@@ -11,6 +11,7 @@ pub mod collection_verification;
 mod collections_ops;
 pub mod consensus;
 pub mod consensus_manager;
+pub mod consensus_state_machine;
 pub mod conversions;
 pub mod errors;
 pub mod shard_distribution;
@@ -212,6 +213,9 @@ pub trait CollectionContainer {
     fn apply_collections_snapshot(&self, data: CollectionsSnapshot) -> Result<(), StorageError>;
 
     fn remove_peer(&self, peer_id: PeerId) -> Result<(), StorageError>;
+
+    /// Whether the given peer has any shard replicas
+    fn peer_has_shards(&self, peer_id: PeerId) -> bool;
 
     fn sync_local_state(&self) -> Result<(), StorageError>;
 

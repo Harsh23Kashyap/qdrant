@@ -323,19 +323,14 @@ impl<S> Tracker<S> {
 
 // Read operations -- only require UniversalRead
 impl<S: UniversalRead> Tracker<S> {
-    pub fn preopen<Fs: CachedReadFs<File = S>>(
-        fs: &Fs,
-        tracker_path: &Path,
-        populate: Populate,
-    ) -> Result<()> {
+    pub fn preopen<Fs: CachedReadFs<File = S>>(fs: &Fs, tracker_path: &Path, populate: Populate) {
         // Default a lazy open to partially populating the header.
         let populate = populate.or_partial(0..size_of::<TrackerHeader>() as u64);
-        fs.schedule_prefetch(
+        fs.schedule_open(
             tracker_path,
             Some(tracker_open_options(populate, false)),
             None,
-        )?;
-        Ok(())
+        );
     }
 
     /// Open an existing PageTracker at the given path
@@ -573,7 +568,7 @@ where
             self.storage.flusher()()?;
             let new_size = end_offset.next_power_of_two();
             create_and_ensure_length(&self.path, new_size)?;
-            self.storage.reopen()?;
+            self.storage.live_reload()?;
         }
 
         let pointer = OptionalPointer::from(pointer);

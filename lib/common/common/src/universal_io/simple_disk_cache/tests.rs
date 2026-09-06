@@ -135,7 +135,7 @@ impl Scenario {
         &self.data[range.start as usize..range.end as usize]
     }
 
-    /// A `get_file_info` for `schedule_reopen`, backed by a `CachedFs`
+    /// A `get_file_info` for `live_preload`, backed by a `CachedFs`
     /// listing snapshot taken now — the schedule-phase view of the remote.
     /// Take a fresh one after growing the remote, as a refresh pass would.
     fn snapshot_file_info<R>(&self) -> impl Fn(&Path) -> Option<FileInfo>
@@ -181,7 +181,6 @@ fn drain_pipeline<R: DiskCacheRemote>(
     tests_mod       R               cfg_predicate               _PREFILL;
     [tests_prefill] [MmapFile]      [cfg(all())]                [true];
     [tests_mmap]    [MmapFile]      [cfg(all())]                [false];
-    [tests_uring]   [IoUringFile]   [cfg(target_os = "linux")]  [false];
 )]
 #[cfg_predicate]
 #[cfg(test)]
@@ -366,7 +365,7 @@ mod tests_mod {
             )
         };
 
-        cache.reopen().unwrap();
+        cache.live_reload().unwrap();
 
         let local = if PREFILL {
             // in case of Populate::PreferBackground, we need to await for
@@ -408,7 +407,7 @@ mod tests_mod {
             crate::universal_io::UniversalIoError::OutOfBounds { .. },
         );
 
-        cache.reopen().unwrap();
+        cache.live_reload().unwrap();
 
         let bytes = cache
             .read::<_, u8>(ReadRange::new(original_len, BLOCK_SIZE as u64), Sequential)
@@ -434,7 +433,7 @@ mod tests_mod {
         // Grow remote past the old tail block boundary.
         let new_data = scn.grow_remote(BLOCK_SIZE);
 
-        cache.reopen().unwrap();
+        cache.live_reload().unwrap();
 
         // Read covers both the originally-partial range [BLOCK_SIZE..old_len)
         // and the newly-grown tail [old_len..BLOCK_SIZE*2). Without the
@@ -460,9 +459,7 @@ mod tests_mod {
         let _ = cache.read::<_, u8>(ReadRange::one(0), Sequential).unwrap();
 
         let new_data = scn.grow_remote(BLOCK_SIZE);
-        cache
-            .schedule_reopen(scn.snapshot_file_info::<R>())
-            .unwrap();
+        let _ = cache.live_preload(scn.snapshot_file_info::<R>());
 
         // Nothing changed yet: same length, and the appended region is still
         // out of bounds.
@@ -472,7 +469,7 @@ mod tests_mod {
             .unwrap_err();
         assert_matches!(err, UniversalIoError::OutOfBounds { .. });
 
-        cache.reopen().unwrap();
+        cache.live_reload().unwrap();
 
         assert_eq!(cache.len::<u8>().unwrap(), new_data.len() as u64);
         // A populated cache staged the tail fetch, so the appended block is
@@ -501,16 +498,14 @@ mod tests_mod {
         let mut cache = scn.open::<R>(PREFILL);
         assert!(!cache.is_ready());
 
-        cache
-            .schedule_reopen(scn.snapshot_file_info::<R>())
-            .unwrap();
+        let _ = cache.live_preload(scn.snapshot_file_info::<R>());
 
         assert!(cache.is_ready());
         assert_eq!(cache.len::<u8>().unwrap(), scn.data.len() as u64);
 
         // A later reopen (nothing staged — the length didn't grow) must
         // leave the mirror alone.
-        cache.reopen().unwrap();
+        cache.live_reload().unwrap();
         assert_eq!(cache.len::<u8>().unwrap(), scn.data.len() as u64);
 
         let bytes = cache.read_whole::<u8>().unwrap();
@@ -533,10 +528,8 @@ mod tests_mod {
             )
         };
 
-        cache
-            .schedule_reopen(scn.snapshot_file_info::<R>())
-            .unwrap();
-        cache.reopen().unwrap();
+        let _ = cache.live_preload(scn.snapshot_file_info::<R>());
+        cache.live_reload().unwrap();
 
         let local = cache.state().unwrap().local;
         assert_eq!(local.mmap().len::<u8>().unwrap(), len_before);
@@ -553,15 +546,11 @@ mod tests_mod {
         let _ = cache.read::<_, u8>(ReadRange::one(0), Sequential).unwrap();
 
         scn.grow_remote(BLOCK_SIZE);
-        cache
-            .schedule_reopen(scn.snapshot_file_info::<R>())
-            .unwrap();
+        let _ = cache.live_preload(scn.snapshot_file_info::<R>());
         let new_data = scn.grow_remote(BLOCK_SIZE);
-        cache
-            .schedule_reopen(scn.snapshot_file_info::<R>())
-            .unwrap();
+        let _ = cache.live_preload(scn.snapshot_file_info::<R>());
 
-        cache.reopen().unwrap();
+        cache.live_reload().unwrap();
 
         assert_eq!(cache.len::<u8>().unwrap(), new_data.len() as u64);
         let bytes = cache.read_whole::<u8>().unwrap();
@@ -579,10 +568,11 @@ mod tests_mod {
 
         let new_data = scn.grow_remote(BLOCK_SIZE);
         let get_file_info = scn.snapshot_file_info::<R>();
-        cache.schedule_reopen(&get_file_info).unwrap();
-        cache.schedule_reopen(&get_file_info).unwrap();
 
-        cache.reopen().unwrap();
+        let _ = cache.live_preload(&get_file_info);
+        let _ = cache.live_preload(&get_file_info);
+
+        cache.live_reload().unwrap();
 
         assert_eq!(cache.len::<u8>().unwrap(), new_data.len() as u64);
         let bytes = cache.read_whole::<u8>().unwrap();
@@ -597,7 +587,8 @@ mod tests_mod {
         let scn = Scenario::new(BLOCK_SIZE);
         let cache = scn.open::<R>(PREFILL);
 
-        let err = cache.schedule_reopen(|_| None).unwrap_err();
+        // `map(drop)` discards the staged future, which is not `Debug`.
+        let err = cache.live_preload(|_| None).map(drop).unwrap_err();
         assert_matches!(err, UniversalIoError::NotFound { .. });
     }
 
@@ -880,5 +871,264 @@ mod tests_mod {
             err,
             crate::universal_io::UniversalIoError::Uninitialized { .. },
         );
+    }
+}
+
+/// `read_bytes_async` against a remote whose sync read surface always errors:
+/// proves cache misses are fetched via the remote's `read_bytes_async`, never
+/// its (pipelined) sync reads.
+#[cfg(test)]
+mod tests_async {
+    use std::marker::PhantomData;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::ext::aligned_vec::ACow;
+    use crate::generic_consts::AccessPattern;
+    use crate::universal_io::{
+        ListedFile, MmapFs, UioResult, UniversalKind, UniversalReadAsync, UniversalReadFsAsync,
+        UserData,
+    };
+
+    fn sync_read_error() -> UniversalIoError {
+        UniversalIoError::Io(std::io::Error::other("sync read on async-only remote"))
+    }
+
+    /// Mmap-backed remote that serves reads only through `read_bytes_async`,
+    /// counting them; every sync read path errors.
+    #[derive(Debug)]
+    struct AsyncOnlyRemote {
+        inner: MmapFile,
+        async_reads: AtomicUsize,
+    }
+
+    struct AsyncOnlyPipeline<'file, U>(PhantomData<fn(&'file AsyncOnlyRemote, U)>);
+
+    impl<'file, U: UserData> ReadPipeline<'file, U> for AsyncOnlyPipeline<'file, U> {
+        type File = AsyncOnlyRemote;
+
+        fn new() -> UioResult<Self> {
+            Ok(Self(PhantomData))
+        }
+
+        fn can_schedule(&mut self) -> bool {
+            true
+        }
+
+        fn schedule<P: AccessPattern>(
+            &mut self,
+            _user_data: U,
+            _file: &'file AsyncOnlyRemote,
+            _range: Range<u64>,
+            _align: usize,
+        ) -> UioResult<()> {
+            Err(sync_read_error())
+        }
+
+        fn schedule_whole(
+            &mut self,
+            _user_data: U,
+            _file: &'file AsyncOnlyRemote,
+            _from: u64,
+        ) -> UioResult<()> {
+            Err(sync_read_error())
+        }
+
+        fn wait(&mut self) -> UioResult<Option<(U, ACow<'file>)>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct AsyncOnlyFs(MmapFs);
+
+    impl UniversalReadFileOps for AsyncOnlyFs {
+        type ContextConfig = ();
+
+        fn from_context(ctx: ()) -> UioResult<Self> {
+            Ok(Self(MmapFs::from_context(ctx)?))
+        }
+
+        fn list_files(&self, prefix_path: &Path) -> UioResult<Vec<ListedFile>> {
+            self.0.list_files(prefix_path)
+        }
+
+        fn exists(&self, path: &Path) -> UioResult<bool> {
+            self.0.exists(path)
+        }
+    }
+
+    impl UniversalReadFs for AsyncOnlyFs {
+        type File = AsyncOnlyRemote;
+        type OpenExtra = ();
+
+        fn open(
+            &self,
+            path: impl AsRef<Path>,
+            options: OpenOptions,
+            extra: (),
+        ) -> UioResult<AsyncOnlyRemote> {
+            Ok(AsyncOnlyRemote {
+                inner: self.0.open(path, options, extra)?,
+                async_reads: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl UniversalReadFsAsync for AsyncOnlyFs {
+        async fn open_async(
+            &self,
+            path: PathBuf,
+            options: OpenOptions,
+            extra: Self::OpenExtra,
+        ) -> UioResult<Self::File> {
+            Ok(AsyncOnlyRemote {
+                inner: self.0.open_async(path, options, extra).await?,
+                async_reads: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl UniversalRead for AsyncOnlyRemote {
+        type Fs = AsyncOnlyFs;
+
+        type ReadPipeline<'a, U>
+            = AsyncOnlyPipeline<'a, U>
+        where
+            Self: 'a,
+            U: UserData;
+
+        fn live_reload(&mut self) -> UioResult<()> {
+            self.inner.live_reload()
+        }
+
+        fn read_bytes<P: AccessPattern>(
+            &self,
+            _range: Range<u64>,
+            _access_pattern: P,
+            _align: usize,
+        ) -> UioResult<ACow<'_>> {
+            Err(sync_read_error())
+        }
+
+        fn len<T>(&self) -> UioResult<u64> {
+            self.inner.len::<T>()
+        }
+
+        fn populate(&self) -> UioResult<()> {
+            Ok(())
+        }
+
+        fn populate_auto() -> bool {
+            false
+        }
+
+        fn clear_ram_cache(&self) -> UioResult<()> {
+            Ok(())
+        }
+
+        fn kind() -> UniversalKind {
+            UniversalKind::Mmap
+        }
+    }
+
+    impl UniversalReadAsync for AsyncOnlyRemote {
+        async fn read_bytes_async<P: AccessPattern>(
+            &self,
+            range: Range<u64>,
+            access_pattern: P,
+            align: usize,
+        ) -> UioResult<ACow<'_>> {
+            // Suspend once so concurrent reads interleave like a real async remote.
+            tokio::task::yield_now().await;
+            self.async_reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_bytes(range, access_pattern, align)
+        }
+    }
+
+    /// A cache miss must fetch through the remote's async read and commit the
+    /// covering blocks to the local mirror.
+    #[tokio::test]
+    async fn miss_fetches_via_remote_async_read() {
+        let scn = Scenario::new(BLOCK_SIZE * 3 + 100);
+        let file = scn.open::<AsyncOnlyRemote>(false);
+
+        let range = 10u64..30;
+        let bytes = file
+            .read_bytes_async(range.clone(), Random, 1)
+            .await
+            .unwrap();
+        assert_eq!(&*bytes, scn.slice(&range));
+
+        let state = file.state().unwrap();
+        assert_eq!(state.remote.async_reads.load(Ordering::Relaxed), 1);
+        assert!(state.local.contains(0..1));
+    }
+
+    /// Blocks committed by an earlier fetch serve later async reads locally,
+    /// without touching the remote again.
+    #[tokio::test]
+    async fn cached_blocks_skip_remote() {
+        let scn = Scenario::new(BLOCK_SIZE * 2);
+        let file = scn.open::<AsyncOnlyRemote>(false);
+
+        let first = 10u64..30;
+        let bytes = file
+            .read_bytes_async(first.clone(), Random, 1)
+            .await
+            .unwrap();
+        assert_eq!(&*bytes, scn.slice(&first));
+
+        // Different range, same block: no second fetch.
+        let second = 100u64..200;
+        let bytes = file
+            .read_bytes_async(second.clone(), Random, 1)
+            .await
+            .unwrap();
+        assert_eq!(&*bytes, scn.slice(&second));
+
+        let state = file.state().unwrap();
+        assert_eq!(state.remote.async_reads.load(Ordering::Relaxed), 1);
+    }
+
+    /// A read spanning a block boundary into the EOF-clamped partial tail
+    /// block resolves in one fetch covering all its blocks.
+    #[tokio::test]
+    async fn spanning_read_commits_all_blocks() {
+        let scn = Scenario::new(BLOCK_SIZE * 3 + 100);
+        let file = scn.open::<AsyncOnlyRemote>(false);
+        let eof = scn.data.len() as u64;
+
+        let range = (BLOCK_SIZE * 3 - 50) as u64..eof;
+        let bytes = file
+            .read_bytes_async(range.clone(), Sequential, 1)
+            .await
+            .unwrap();
+        assert_eq!(&*bytes, scn.slice(&range));
+
+        let state = file.state().unwrap();
+        assert_eq!(state.remote.async_reads.load(Ordering::Relaxed), 1);
+        assert!(state.local.contains(2..4));
+    }
+
+    /// Parity with the sync path for the no-fetch branches: empty reads
+    /// resolve to an empty slice, out-of-bounds reads error.
+    #[tokio::test]
+    async fn empty_and_out_of_bounds_need_no_fetch() {
+        let scn = Scenario::new(1024);
+        let file = scn.open::<AsyncOnlyRemote>(false);
+
+        let bytes = file.read_bytes_async(5..5, Sequential, 1).await.unwrap();
+        assert!(bytes.is_empty());
+
+        let err = file
+            .read_bytes_async(1000..1100, Sequential, 1)
+            .await
+            .unwrap_err();
+        assert_matches!(err, UniversalIoError::OutOfBounds { .. });
+
+        let state = file.state().unwrap();
+        assert_eq!(state.remote.async_reads.load(Ordering::Relaxed), 0);
     }
 }

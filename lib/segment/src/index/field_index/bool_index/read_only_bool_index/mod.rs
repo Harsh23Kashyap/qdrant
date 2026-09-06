@@ -235,6 +235,7 @@ mod tests {
     #[case(true, false)]
     #[case(true, true)]
     #[case(false, false)]
+    #[case(false, true)]
     fn live_reload_matches_fresh_open(
         #[case] materialize_before_reload: bool,
         #[case] preload: bool,
@@ -484,6 +485,7 @@ mod tests {
             )
             .unwrap()
         );
+        futures::executor::block_on(cached_fs.wait_all());
 
         // Everything `open` reads must now come from the prefetch pool.
         fs_err::remove_dir_all(dir.path().join(TRUES_DIRNAME)).unwrap();

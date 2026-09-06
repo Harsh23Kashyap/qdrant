@@ -16,6 +16,7 @@
 //! observe the appended bytes right away; the appended blocks themselves
 //! fault in from the remote on first read.
 
+mod async_io;
 mod fs;
 mod pipeline;
 #[cfg(test)]
@@ -121,14 +122,14 @@ impl<A: AsyncAppend + Clone> CachedBlobFile<A> {
             );
         }
 
-        self.cache.schedule_reopen(|_| {
+        let _ = self.cache.live_preload(|_| {
             Some(FileInfo {
                 size: new_len,
                 last_modified: None,
                 etag: None,
             })
-        })?;
-        self.cache.reopen()
+        });
+        self.cache.live_reload()
     }
 
     /// Replace the whole remote object with `[0, offset) + data`, built on
@@ -191,15 +192,15 @@ where
         Self: 'a,
         U: UserData;
 
-    fn reopen(&mut self) -> UioResult<()> {
-        self.cache.reopen()
+    fn live_reload(&mut self) -> UioResult<()> {
+        self.cache.live_reload()
     }
 
-    fn schedule_reopen<F: FnOnce(&Path) -> Option<FileInfo>>(
+    fn live_preload<F: FnOnce(&Path) -> Option<FileInfo>>(
         &self,
         get_file_info: F,
-    ) -> UioResult<()> {
-        self.cache.schedule_reopen(get_file_info)
+    ) -> UioResult<impl Future<Output = ()> + Send + 'static> {
+        self.cache.live_preload(get_file_info)
     }
 
     fn read_bytes<P: AccessPattern>(

@@ -1415,6 +1415,7 @@ impl From<Datatype> for VectorStorageDatatype {
 #[anonymize(false)]
 pub struct VectorParams {
     /// Size of a vectors used
+    #[schemars(range(min = 1, max = 65536))]
     #[validate(custom(function = "validate_nonzerou64_range_min_1_max_65536"))]
     pub size: NonZeroU64,
     /// Type of distance function used for measuring distance between vectors
@@ -1943,6 +1944,12 @@ pub struct PeerMetadata {
 }
 
 impl PeerMetadata {
+    /// Metadata of a peer running `version`, to set up a state for a test
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new(version: Version) -> Self {
+        Self { version }
+    }
+
     pub fn current() -> Self {
         Self {
             version: defaults::QDRANT_VERSION.clone(),

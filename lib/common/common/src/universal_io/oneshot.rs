@@ -35,8 +35,8 @@ impl<S: UniversalRead> OneshotFile<S> {
     ///
     /// A one-shot file is always read in full, so the prefetch populates it —
     /// the fetch overlaps whatever runs between the schedule and the open.
-    pub fn preopen<Fs: CachedReadFs<File = S>>(fs: &Fs, path: impl AsRef<Path>) -> UioResult<()> {
-        fs.schedule_prefetch(
+    pub fn preopen<Fs: CachedReadFs<File = S>>(fs: &Fs, path: impl AsRef<Path>) {
+        fs.schedule_open(
             path.as_ref(),
             Some(Self::open_options(Populate::PreferBackground)),
             None,

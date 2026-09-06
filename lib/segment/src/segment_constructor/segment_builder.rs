@@ -108,7 +108,9 @@ impl SegmentBuilder {
 
         for (vector_name, vector_config) in &segment_config.vector_data {
             let vector_storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
-            let vector_storage = open_vector_storage(vector_config, &vector_storage_path)?;
+            let vector_index_path = get_vector_index_path(temp_dir.path(), vector_name);
+            let vector_storage =
+                open_vector_storage(vector_config, &vector_storage_path, &vector_index_path)?;
 
             vector_data.insert(
                 vector_name.to_owned(),
@@ -621,6 +623,7 @@ impl SegmentBuilder {
 
             id_tracker.mapping_flusher()()?;
             id_tracker.versions_flusher()()?;
+            check_process_stopped(stopped)?;
             let id_tracker_arc = Arc::new(AtomicRefCell::new(id_tracker));
 
             let mut quantized_vectors = Self::update_quantization(
@@ -664,6 +667,7 @@ impl SegmentBuilder {
 
                 vector_storages_arc.insert(vector_name.to_owned(), vector_storage_arc);
             }
+            check_process_stopped(stopped)?;
 
             let payload_index_path = get_payload_index_path(temp_dir.path());
 
@@ -700,6 +704,7 @@ impl SegmentBuilder {
 
             // Arc permit to share it with each vector store
             let permit = Arc::new(permit);
+            check_process_stopped(stopped)?;
 
             progress_vector_index.start();
             for (vector_name, vector_config) in &segment_config.vector_data {
@@ -835,12 +840,11 @@ impl SegmentBuilder {
         progress: ProgressTracker,
     ) -> OperationResult<HashMap<VectorNameBuf, QuantizedVectors>> {
         progress.start();
-        let config = segment_config.clone();
 
         let mut quantized_vectors_map = HashMap::new();
 
         for (vector_name, vector_info) in vector_storages {
-            let Some(vector_config) = config.vector_data.get(vector_name) else {
+            let Some(vector_config) = segment_config.vector_data.get(vector_name) else {
                 continue;
             };
 
@@ -853,7 +857,7 @@ impl SegmentBuilder {
 
             let max_threads = permit.num_cpus as usize;
 
-            if let Some(quantization_config) = config.quantization_config(vector_name) {
+            if let Some(quantization_config) = segment_config.quantization_config(vector_name) {
                 // Don't build quantization for appendable vectors if quantization method does not support it
                 if is_appendable && !quantization_config.supports_appendable() {
                     continue;

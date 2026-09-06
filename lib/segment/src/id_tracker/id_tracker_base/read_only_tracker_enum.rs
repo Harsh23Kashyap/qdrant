@@ -3,6 +3,7 @@ use std::path::Path;
 use common::bitvec::BitSlice;
 use common::types::PointOffsetType;
 use common::universal_io::{CachedReadFs, UniversalRead, UniversalReadFs};
+use futures::future::BoxFuture;
 
 use crate::common::operation_error::OperationResult;
 use crate::id_tracker::disk_id_tracker::ReadOnlyDiskIdTracker;
@@ -29,7 +30,8 @@ impl<S: UniversalRead> ReadOnlyIdTrackerEnum<S> {
         if ReadOnlyImmutableIdTracker::try_preopen(fs, segment_path)? {
             return Ok(());
         }
-        ReadOnlyAppendableIdTracker::preopen(fs, segment_path)
+        ReadOnlyAppendableIdTracker::preopen(fs, segment_path);
+        Ok(())
     }
 
     /// Detect the persisted id-tracker format and load it, by *attempting* each
@@ -57,7 +59,10 @@ impl<S: UniversalRead> ReadOnlyIdTrackerEnum<S> {
     }
 
     /// Stage everything the next [`Self::live_reload`] needs. Shared access.
-    pub fn live_preload(&self, fs: &impl CachedReadFs<File = S>) -> OperationResult<()> {
+    pub fn live_preload(
+        &self,
+        fs: &impl CachedReadFs<File = S>,
+    ) -> OperationResult<Vec<BoxFuture<'static, ()>>> {
         match self {
             Self::Appendable(id_tracker) => id_tracker.live_preload(fs),
             Self::Immutable(id_tracker) => id_tracker.live_preload(fs),

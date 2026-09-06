@@ -3,6 +3,8 @@ use std::io::Cursor;
 use common::generic_consts::Sequential;
 use common::types::PointOffsetType;
 use common::universal_io::{CachedReadFs, OkNotFound, ReadRange, UniversalRead, UniversalReadFs};
+use futures::FutureExt;
+use futures::future::BoxFuture;
 
 use super::ReadOnlyAppendableIdTracker;
 use crate::common::operation_error::OperationResult;
@@ -62,27 +64,35 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
     /// Stage what the next [`live_reload`](Self::live_reload) does per file: a
     /// reopen for held handles, a prefetch for files it opens lazily. Absence
     /// is tolerated the same way the reload tolerates it.
-    pub fn live_preload(&self, fs: &impl CachedReadFs<File = S>) -> OperationResult<()> {
+    pub fn live_preload(
+        &self,
+        fs: &impl CachedReadFs<File = S>,
+    ) -> OperationResult<Vec<BoxFuture<'static, ()>>> {
         let options = Self::open_options();
+        let mut futs: Vec<BoxFuture<'static, ()>> = Vec::new();
         for (file, path) in [
             (&self.versions_file, versions_path(&self.segment_path)),
             (&self.mappings_file, mappings_path(&self.segment_path)),
         ] {
             match file {
-                Some(file) => file
-                    .schedule_reopen(|p| fs.cached_file_info(p))
-                    .ok_not_found()?,
-                None => fs
-                    .schedule_prefetch(&path, Some(options), None)
-                    .ok_not_found()?,
+                Some(file) => {
+                    futs.extend(
+                        file.live_preload(|p| fs.cached_file_info(p))
+                            .ok_not_found()?
+                            .map(FutureExt::boxed),
+                    );
+                }
+                None => {
+                    fs.schedule_open(&path, Some(options), None);
+                }
             };
         }
-        Ok(())
+        Ok(futs)
     }
 
     /// Consume mapping and version changes appended to storage since the last reload.
     ///
-    /// File handles are refreshed via [`UniversalRead::reopen`] so data appended by the writer
+    /// File handles are refreshed via [`UniversalRead::live_reload`] so data appended by the writer
     /// becomes visible; not-yet-opened files are opened lazily through `fs` (a caching wrapper's
     /// prefetch pool serves these opens when staged). Both result lists are sorted ascending.
     ///
@@ -162,17 +172,21 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
     ) -> OperationResult<Vec<MappingChange>> {
         // The mappings file is absent until the writer flushes the first point; open it lazily once
         // it appears. Until then there is nothing to read.
-        if self.mappings_file.is_none() {
-            self.mappings_file = Self::try_open(fs, &mappings_path(&self.segment_path))?;
+        match self.mappings_file.as_mut() {
+            Some(file) => {
+                // Refresh the handle to observe data appended by the writer. A lazily-opened handle whose
+                // object does not exist yet (e.g. S3) reports `NotFound` here or from `len`; treat that as
+                // an empty file.
+                file.live_reload().ok_not_found()?;
+            }
+            None => {
+                self.mappings_file = Self::try_open(fs, &mappings_path(&self.segment_path))?;
+            }
         }
         let Some(file) = self.mappings_file.as_mut() else {
             return Ok(Vec::new());
         };
 
-        // Refresh the handle to observe data appended by the writer. A lazily-opened handle whose
-        // object does not exist yet (e.g. S3) reports `NotFound` here or from `len`; treat that as
-        // an empty file.
-        file.reopen().ok_not_found()?;
         let Some(file_len) = file.len::<u8>().ok_not_found()? else {
             return Ok(Vec::new());
         };
@@ -216,17 +230,20 @@ impl<S: UniversalRead> ReadOnlyAppendableIdTracker<S> {
     fn reload_versions(&mut self, fs: &impl UniversalReadFs<File = S>) -> OperationResult<usize> {
         // The versions file is absent until the writer flushes the first point; open it lazily once
         // it appears. Until then no version is committed.
-        if self.versions_file.is_none() {
-            self.versions_file = Self::try_open(fs, &versions_path(&self.segment_path))?;
+        match self.versions_file.as_mut() {
+            Some(versions_file) => {
+                // Refresh the handle to observe data appended by the writer. A lazily-opened handle whose
+                // object does not exist yet (e.g. S3) reports `NotFound` here or from `len`; treat that as
+                // an empty file (no committed versions).
+                versions_file.live_reload().ok_not_found()?;
+            }
+            None => {
+                self.versions_file = Self::try_open(fs, &versions_path(&self.segment_path))?;
+            }
         }
         let Some(versions_file) = self.versions_file.as_mut() else {
             return Ok(self.internal_to_version.len());
         };
-
-        // Refresh the handle to observe data appended by the writer. A lazily-opened handle whose
-        // object does not exist yet (e.g. S3) reports `NotFound` here or from `len`; treat that as
-        // an empty file (no committed versions).
-        versions_file.reopen().ok_not_found()?;
 
         // Disjoint field borrow so the read (from `versions_file`) can extend `internal_to_version`.
         let internal_to_version = &mut self.internal_to_version;

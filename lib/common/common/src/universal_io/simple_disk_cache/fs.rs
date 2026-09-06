@@ -27,11 +27,11 @@ pub struct DiskCacheFsContext<C> {
 #[derive(Default, Debug)]
 pub struct DiskCacheFsOpenExtra<RemoteExtra: OpenExtra> {
     /// Extra options passed to the remote
-    remote_extra: RemoteExtra,
+    pub(super) remote_extra: RemoteExtra,
     /// The length of the file, if known
-    known_len: Option<u64>,
+    pub(super) known_len: Option<u64>,
     /// Entity tag of the remote object, if known
-    known_etag: Option<String>,
+    pub(super) known_etag: Option<String>,
 }
 
 impl<RemoteExtra: OpenExtra> OpenExtra for DiskCacheFsOpenExtra<RemoteExtra> {
@@ -69,8 +69,8 @@ pub struct DiskCacheFs<R>
 where
     R: UniversalRead,
 {
-    config: Arc<DiskCacheConfig>,
-    remote_fs: R::Fs,
+    pub(super) config: Arc<DiskCacheConfig>,
+    pub(super) remote_fs: R::Fs,
 }
 
 impl<R> Clone for DiskCacheFs<R>
@@ -107,7 +107,7 @@ impl<R: UniversalRead> DiskCacheFs<R> {
         Self { config, remote_fs }
     }
 
-    fn open_remote(
+    pub(super) fn open_remote(
         &self,
         path: impl AsRef<Path>,
         extra: <R::Fs as UniversalReadFs>::OpenExtra,
@@ -119,7 +119,7 @@ impl<R: UniversalRead> DiskCacheFs<R> {
 
 impl<R> UniversalReadFileOps for DiskCacheFs<R>
 where
-    R: UniversalRead,
+    R: UniversalRead + 'static,
 {
     type ContextConfig = DiskCacheFsContext<<R::Fs as UniversalReadFileOps>::ContextConfig>;
 
@@ -153,7 +153,7 @@ where
 ///
 /// The name carries no state across opens: a mirror is truncated when its
 /// [`LocalState`] materializes and removed when its `DiskCache` is dropped.
-fn unique_local_path(mut path: PathBuf) -> PathBuf {
+pub(super) fn unique_local_path(mut path: PathBuf) -> PathBuf {
     static NEXT_MIRROR_ID: AtomicU64 = AtomicU64::new(0);
     let id = NEXT_MIRROR_ID.fetch_add(1, Ordering::Relaxed);
     // Process id disambiguates processes sharing a local cache dir.

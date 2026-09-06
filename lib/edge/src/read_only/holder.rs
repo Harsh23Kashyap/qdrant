@@ -1,11 +1,12 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use segment::index::UniversalReadExt;
 use segment::segment::read_only::ReadOnlySegment;
 use uuid::Uuid;
+
+use crate::read_only::enumerate::ListedSegment;
 
 /// In-memory inventory of read-only segments, keyed by the leader-assigned segment UUID.
 ///
@@ -38,6 +39,10 @@ impl<S: UniversalReadExt + 'static> ReadOnlySegmentHolder<S> {
         self.by_uuid.contains_key(uuid)
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.by_uuid.len()
+    }
+
     pub(crate) fn uuids(&self) -> Vec<Uuid> {
         self.by_uuid.keys().copied().collect()
     }
@@ -63,7 +68,7 @@ impl<S: UniversalReadExt + 'static> ReadOnlySegmentHolder<S> {
     /// Drop every segment whose UUID is no longer present on disk (e.g. removed by the leader's
     /// optimization). This only releases the follower's handle/mmap — it never touches the leader's
     /// files.
-    pub(crate) fn remove_missing(&mut self, on_disk: &HashMap<Uuid, PathBuf>) {
+    pub(crate) fn remove_missing(&mut self, on_disk: &HashMap<Uuid, ListedSegment>) {
         self.by_uuid.retain(|uuid, _| on_disk.contains_key(uuid));
     }
 

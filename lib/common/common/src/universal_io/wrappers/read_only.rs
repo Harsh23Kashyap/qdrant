@@ -14,10 +14,12 @@ use crate::universal_io::{
     Item, ListedFile, OpenOptions, ReadBytesItem, ReadRange, UioResult, UniversalIoError,
     UniversalKind, UniversalRead, UniversalReadFs, UserData,
 };
+// Async impls (`UniversalReadAsync` / `UniversalReadFsAsync`) live in
+// `super::async_io`, gated on the wrapped backend being async-capable.
 
 #[derive(Debug, TransparentWrapper)]
 #[repr(transparent)]
-pub struct ReadOnly<S>(S);
+pub struct ReadOnly<S>(pub(super) S);
 
 /// Phantom filesystem handle whose `File` type is `ReadOnly<F::File>`.
 ///
@@ -27,7 +29,7 @@ pub struct ReadOnly<S>(S);
 /// rarely instantiated; callers use [`ReadOnly::open`] with the
 /// underlying `&S::Fs` directly.
 #[derive(Clone)]
-pub struct ReadOnlyFs<F>(F);
+pub struct ReadOnlyFs<F>(pub(super) F);
 
 impl<F: fmt::Debug> fmt::Debug for ReadOnlyFs<F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -112,16 +114,16 @@ where
         U: UserData;
 
     #[inline]
-    fn reopen(&mut self) -> UioResult<()> {
-        self.0.reopen()
+    fn live_reload(&mut self) -> UioResult<()> {
+        self.0.live_reload()
     }
 
     #[inline]
-    fn schedule_reopen<F: FnOnce(&Path) -> Option<FileInfo>>(
+    fn live_preload<F: FnOnce(&Path) -> Option<FileInfo>>(
         &self,
         get_file_info: F,
-    ) -> UioResult<()> {
-        self.0.schedule_reopen(get_file_info)
+    ) -> UioResult<impl Future<Output = ()> + Send + 'static> {
+        self.0.live_preload(get_file_info)
     }
 
     #[inline]
