@@ -985,7 +985,15 @@ fn restore_snapshot_in_place(snapshot_path: &Path) -> OperationResult<()> {
         unpack_snapshot(snapshot_path)?;
     } else {
         let segment_path = segments_dir.join(segment_id);
-        tar_unpack_file(snapshot_path, &segment_path)?;
+        // A malformed user-supplied segment archive is a client error (400),
+        // while a genuine local IO failure stays an internal error (500)
+        tar_unpack_file(snapshot_path, &segment_path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::InvalidData {
+                OperationError::validation_error(format!("Malformed segment archive: {err}"))
+            } else {
+                OperationError::from(err)
+            }
+        })?;
 
         let inner_path = segment_path.join(SNAPSHOT_PATH);
         if inner_path.is_dir() {
@@ -1041,4 +1049,27 @@ fn unpack_snapshot(segment_path: &Path) -> OperationResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_snapshot_rejects_malformed_segment_archive() {
+        let temp = std::env::temp_dir()
+            .join(format!("segment-restore-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let archive_path = temp.join("0.tar");
+        std::fs::write(&archive_path, b"this is not a tar archive").unwrap();
+
+        let result = restore_snapshot_in_place(&archive_path);
+        match result {
+            Err(OperationError::ValidationError { .. }) => (),
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
 }
