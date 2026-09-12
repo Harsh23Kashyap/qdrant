@@ -485,8 +485,8 @@ mod tests {
             false,
         );
         match result {
-            Err(CollectionError::BadRequest { .. }) => (),
-            other => panic!("expected BadRequest, got {other:?}"),
+            Err(CollectionError::BadInput { .. }) => (),
+            other => panic!("expected BadInput, got {other:?}"),
         }
 
         let _ = std::fs::remove_dir_all(&temp);
