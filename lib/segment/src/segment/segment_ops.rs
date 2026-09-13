@@ -757,10 +757,13 @@ impl Segment {
     /// - `segment.restore_snapshot("foo/bar/segment-id.tar")`  (tar archive)
     /// - `segment.restore_snapshot("foo/bar/segment-id")`      (directory)
     pub fn restore_snapshot_in_place(snapshot_path: &Path) -> OperationResult<()> {
-        restore_snapshot_in_place(snapshot_path).map_err(|err| {
-            OperationError::service_error(format!(
+        restore_snapshot_in_place(snapshot_path).map_err(|err| match err {
+            // A malformed archive is a client error; keep its classification
+            // instead of downgrading it to an internal error (see #10553).
+            err @ OperationError::ValidationError { .. } => err,
+            err => OperationError::service_error(format!(
                 "Failed to restore snapshot from {snapshot_path:?}: {err}",
-            ))
+            )),
         })
     }
 
@@ -1057,14 +1060,14 @@ mod tests {
 
     #[test]
     fn restore_snapshot_rejects_malformed_segment_archive() {
-        let temp = std::env::temp_dir()
-            .join(format!("segment-restore-test-{}", std::process::id()));
+        let temp =
+            std::env::temp_dir().join(format!("segment-restore-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let archive_path = temp.join("0.tar");
         std::fs::write(&archive_path, b"this is not a tar archive").unwrap();
 
-        let result = restore_snapshot_in_place(&archive_path);
+        let result = Segment::restore_snapshot_in_place(&archive_path);
         match result {
             Err(OperationError::ValidationError { .. }) => (),
             other => panic!("expected ValidationError, got {other:?}"),
