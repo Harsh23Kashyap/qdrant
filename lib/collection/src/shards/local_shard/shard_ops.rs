@@ -7,7 +7,8 @@ use common::types::DeferredBehavior;
 use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::data_types::order_by::OrderBy;
 use segment::types::{
-    ExtendedPointId, Filter, ScoredPoint, WithPayload, WithPayloadInterface, WithVector,
+    Condition, ExtendedPointId, Filter, IsEmptyCondition, ScoredPoint, WithPayload,
+    WithPayloadInterface, WithVector,
 };
 use shard::count::CountRequestInternal;
 use shard::retrieve::record_internal::RecordInternal;
@@ -399,7 +400,16 @@ impl ShardOperation for LocalShard {
         })?;
         let start_time = Instant::now();
         let cpu_utilization = hw_measurement_acc.cpu_utilization();
-        let result: CollectionResult<usize> = if request.exact {
+        // A top-level `is_empty` cardinality is currently off by ~35% on
+        // common data (e.g. 80% field presence → ~35% undercount). The
+        // simpler and safer fix is to fall back to the exact path: the
+        // "field has no value" set is the null-index's bread and butter
+        // (it is exact for `is_null`), and routing the approximate count
+        // through it is a follow-up.
+        //
+        // See: qdrant/qdrant#10120
+        let force_exact = !request.exact && is_top_level_is_empty(request.filter.as_ref());
+        let result: CollectionResult<usize> = if request.exact || force_exact {
             let timeout = self.timeout_or_default_search_timeout(timeout);
             match tokio::time::timeout(
                 timeout,
@@ -684,5 +694,134 @@ impl LocalShard {
             deferred_behavior,
         )
         .await
+    }
+}
+
+/// True when the filter is a top-level `is_empty` condition. Such filters
+/// currently route through the approximate-count path whose estimate is
+/// systematically biased low (qdrant/qdrant#10120); the count endpoint
+/// should fall back to the exact path for them.
+///
+/// `should` and `must_not` are deserialized through `MaybeOneOrMany`, which
+/// preserves `[]` as `Some(vec![])`. An empty `must_not` is a no-op at
+/// filter evaluation, and an empty `should` matches nothing — neither
+/// changes the result of a `must: [IsEmpty]` filter against the exact
+/// path, so neither should disqualify the helper.
+///
+/// `min_should` disqualifies unconditionally: it changes the boolean
+/// semantics of the filter and the count path needs to be re-evaluated
+/// on the approximate side, so we keep the conservative behaviour.
+fn is_top_level_is_empty(filter: Option<&Filter>) -> bool {
+    let Some(filter) = filter else {
+        return false;
+    };
+    let has_non_empty_should = filter.should.as_deref().is_some_and(|s| !s.is_empty());
+    let has_non_empty_must_not = filter.must_not.as_deref().is_some_and(|m| !m.is_empty());
+    if has_non_empty_should || has_non_empty_must_not || filter.min_should.is_some() {
+        return false;
+    }
+    match filter.must.as_deref() {
+        Some([Condition::IsEmpty(_)]) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use segment::types::{FieldCondition, PayloadField};
+
+    use super::*;
+
+    fn cond_is_empty() -> Condition {
+        Condition::IsEmpty(IsEmptyCondition {
+            is_empty: segment::types::PayloadField {
+                key: "kw".parse().unwrap(),
+            },
+        })
+    }
+
+    fn cond_match() -> Condition {
+        Condition::Field(FieldCondition::new_match(
+            "kw".parse().unwrap(),
+            segment::types::Match::Value(segment::types::MatchValue {
+                value: segment::types::ValueVariants::String("red".to_string()),
+            }),
+        ))
+    }
+
+    #[test]
+    fn is_top_level_is_empty_matches_single_is_empty() {
+        let filter = Filter::new_must(cond_is_empty());
+        assert!(is_top_level_is_empty(Some(&filter)));
+    }
+
+    #[test]
+    fn is_top_level_is_empty_rejects_none() {
+        assert!(!is_top_level_is_empty(None));
+    }
+
+    #[test]
+    fn is_top_level_is_empty_rejects_composite_filters() {
+        // must: [IsEmpty, Match] — composite, not pure IsEmpty
+        let mut filter = Filter::new_must(cond_is_empty());
+        filter.must = Some(vec![cond_is_empty(), cond_match()]);
+        assert!(!is_top_level_is_empty(Some(&filter)));
+    }
+
+    #[test]
+    fn is_top_level_is_empty_rejects_should() {
+        // should: [Match] with must: [IsEmpty]
+        let mut filter = Filter::new_must(cond_is_empty());
+        filter.should = Some(vec![cond_match()]);
+        assert!(!is_top_level_is_empty(Some(&filter)));
+    }
+
+    #[test]
+    fn is_top_level_is_empty_rejects_must_not() {
+        // must: [IsEmpty], must_not: [Match]
+        let mut filter = Filter::new_must(cond_is_empty());
+        filter.must_not = Some(vec![cond_match()]);
+        assert!(!is_top_level_is_empty(Some(&filter)));
+    }
+
+    /// An empty `should: []` is a no-op (the deserializer preserves `[]` as
+    /// `Some(vec![])` via `MaybeOneOrMany`), so the helper must still
+    /// recognise the request as a top-level `is_empty` and force exact.
+    #[test]
+    fn is_top_level_is_empty_allows_empty_should() {
+        let mut filter = Filter::new_must(cond_is_empty());
+        filter.should = Some(vec![]);
+        assert!(is_top_level_is_empty(Some(&filter)));
+    }
+
+    /// Same as above for `must_not: []`. The exact bug CodeRabbit flagged
+    /// on PR #10348: `must_not: []` was treated as a non-empty clause and
+    /// caused the helper to fall through to the approximate path.
+    #[test]
+    fn is_top_level_is_empty_allows_empty_must_not() {
+        let mut filter = Filter::new_must(cond_is_empty());
+        filter.must_not = Some(vec![]);
+        assert!(is_top_level_is_empty(Some(&filter)));
+    }
+
+    /// Both empty at once still matches.
+    #[test]
+    fn is_top_level_is_empty_allows_empty_should_and_must_not() {
+        let mut filter = Filter::new_must(cond_is_empty());
+        filter.should = Some(vec![]);
+        filter.must_not = Some(vec![]);
+        assert!(is_top_level_is_empty(Some(&filter)));
+    }
+
+    /// `min_should` changes the boolean semantics of the filter and is
+    /// rejected unconditionally, even if its inner conditions are empty.
+    #[test]
+    fn is_top_level_is_empty_rejects_min_should() {
+        let mut filter = Filter::new_must(cond_is_empty());
+        filter.min_should = Some(segment::types::MinShould {
+            conditions: vec![cond_match()],
+            min_count: 1,
+        });
+        assert!(!is_top_level_is_empty(Some(&filter)));
     }
 }
