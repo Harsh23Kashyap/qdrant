@@ -4,6 +4,8 @@
 
 mod test_congruence;
 
+use std::path::PathBuf;
+
 use common::bitvec::BitVec;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
@@ -175,6 +177,7 @@ fn test_prefix_search() {
         stemmer: None,
         ascii_folding: None,
         enable_hnsw: None,
+        scoring: None,
     };
 
     let mut index =
@@ -235,10 +238,11 @@ fn test_phrase_matching() {
         stemmer: None,
         ascii_folding: None,
         enable_hnsw: None,
+        scoring: None,
     };
 
     let mut mutable_index =
-        FullTextIndex::builder_gridstore(temp_dir.path().to_path_buf(), config.clone())
+        FullTextIndex::builder_gridstore(temp_dir.path().to_path_buf(), config.clone(), false)
             .make_empty()
             .unwrap();
 
@@ -248,6 +252,7 @@ fn test_phrase_matching() {
         config.clone(),
         true,
         &empty_deleted,
+        true,
     );
     mmap_builder.init().unwrap();
 
@@ -369,6 +374,7 @@ fn test_ascii_folding_in_full_text_index_word() {
         stemmer: None,
         ascii_folding: Some(true),
         enable_hnsw: None,
+        scoring: None,
     };
     let config_disabled = TextIndexParams {
         ascii_folding: Some(false),
@@ -482,6 +488,7 @@ fn test_special_check_condition_match_text_any() {
         stemmer: None,
         ascii_folding: None,
         enable_hnsw: None,
+        scoring: None,
     };
 
     let mut index = FullTextIndex::new_gridstore(temp_dir.path().to_path_buf(), config, true)
@@ -549,4 +556,185 @@ fn test_special_check_condition_match_text_any() {
         Some(false),
         "MatchTextAny must not match 'neutral text' for query 'good cheap'"
     );
+}
+
+/// An mmap index over two documents: point 0 has 3 tokens, point 1 has 7 with
+/// repeats, recording lengths as `scoring` says.
+fn two_document_mmap_index(path: PathBuf, scoring: bool) -> FullTextIndex {
+    let hw_counter = HardwareCounterCell::new();
+    let config = TextIndexParams {
+        r#type: TextIndexType::Text,
+        tokenizer: TokenizerType::Whitespace,
+        min_token_len: None,
+        max_token_len: None,
+        lowercase: Some(true),
+        phrase_matching: Some(false),
+        on_disk: None,
+        memory: None,
+        stopwords: None,
+        stemmer: None,
+        ascii_folding: None,
+        enable_hnsw: None,
+        scoring: None,
+    };
+
+    let empty_deleted = BitVec::new();
+    let mut builder = FullTextIndex::builder_mmap(path, config, true, &empty_deleted, scoring);
+    builder.init().unwrap();
+    // Point 1 repeats "the" three times: 7 tokens, 5 distinct.
+    builder
+        .add_many(0, vec!["alpha beta gamma".to_string()], &hw_counter)
+        .unwrap();
+    builder
+        .add_many(
+            1,
+            vec!["the cat sat on the mat the".to_string()],
+            &hw_counter,
+        )
+        .unwrap();
+
+    builder.finalize().unwrap()
+}
+
+/// The mmap build path records lengths too, end to end: `add_many` measures,
+/// `create` writes the sidecar, and the index that comes back out of `finalize`
+/// carries them.
+#[test]
+fn mmap_builder_records_doc_len() {
+    use crate::index::field_index::full_text_index::inverted_index::immutable_inverted_index::ImmutableInvertedIndex;
+
+    let temp_dir = Builder::new().prefix("mmap_doc_len").tempdir().unwrap();
+    let index = two_document_mmap_index(temp_dir.path().to_path_buf(), true);
+    let FullTextIndex::OnDisk(on_disk) = &index else {
+        panic!("expected an on-disk index");
+    };
+    assert!(on_disk.records_doc_len(), "the sidecar was written");
+
+    let immutable = ImmutableInvertedIndex::try_from(&on_disk.inverted_index).unwrap();
+    assert_eq!(
+        immutable.point_to_doc_len(),
+        Some([3, 7].as_slice()),
+        "lengths must survive the mmap build path, counting repeats",
+    );
+}
+
+/// `new_mmap` under scoring reports an index without a length sidecar absent,
+/// so the caller rebuilds it from payload, and opens one with the sidecar.
+/// Without scoring, both open.
+#[test]
+fn new_mmap_without_lengths_is_absent_under_scoring() {
+    use crate::data_types::index::TextScoringParams;
+    use crate::types::Memory;
+
+    let config = |scoring: bool| TextIndexParams {
+        tokenizer: TokenizerType::Whitespace,
+        lowercase: Some(true),
+        phrase_matching: Some(false),
+        scoring: scoring.then(TextScoringParams::default),
+        ..TextIndexParams::default()
+    };
+    let deleted = BitVec::new();
+    let open = |path: &std::path::Path, scoring: bool| {
+        FullTextIndex::new_mmap(path.to_path_buf(), config(scoring), Memory::Cold, &deleted)
+            .unwrap()
+    };
+
+    let without = Builder::new().prefix("mmap_no_lengths").tempdir().unwrap();
+    drop(two_document_mmap_index(without.path().to_path_buf(), false));
+    assert!(
+        open(without.path(), false).is_some(),
+        "opens without scoring"
+    );
+    assert!(
+        open(without.path(), true).is_none(),
+        "no sidecar under scoring must read as absent",
+    );
+
+    let with = Builder::new().prefix("mmap_lengths").tempdir().unwrap();
+    drop(two_document_mmap_index(with.path().to_path_buf(), true));
+    assert!(
+        open(with.path(), true).is_some(),
+        "the sidecar serves scoring"
+    );
+    assert!(open(with.path(), false).is_some(), "and opens without it");
+}
+
+/// Every answer of [`FullTextIndexRead::doc_len_batch`], in `point_ids` order.
+fn doc_lens(
+    index: &FullTextIndex,
+    point_ids: &[PointOffsetType],
+    hw_counter: &HardwareCounterCell,
+) -> Vec<Option<u32>> {
+    let mut out = vec![Some(u32::MAX); point_ids.len()];
+    index
+        .doc_len_batch(point_ids, hw_counter, |at, doc_len| out[at] = doc_len)
+        .unwrap();
+    out
+}
+
+/// What a scorer gets from a segment: `|d|` per point, and the total to
+/// divide by `points_count`. Goes through the read surface rather than the
+/// inverted index, since that is the side a scorer sees.
+#[test]
+fn read_surface_exposes_doc_len_and_total() {
+    let temp_dir = Builder::new().prefix("doc_len_reads").tempdir().unwrap();
+    let index = two_document_mmap_index(temp_dir.path().to_path_buf(), true);
+
+    let hw_counter = HardwareCounterCell::new();
+    // The third is outside the index. Not a zero-length document.
+    assert_eq!(
+        doc_lens(&index, &[0, 1, 2], &hw_counter),
+        [Some(3), Some(7), None]
+    );
+    assert_eq!(index.total_tokens(), Some(10));
+    assert_eq!(index.points_count(), 2);
+}
+
+/// The same surface on a non-recording index: absent, not zero.
+#[test]
+fn read_surface_reports_absence_without_scoring() {
+    let temp_dir = Builder::new().prefix("no_doc_len_reads").tempdir().unwrap();
+    let index = two_document_mmap_index(temp_dir.path().to_path_buf(), false);
+
+    let hw_counter = HardwareCounterCell::new();
+    assert_eq!(doc_lens(&index, &[0, 1], &hw_counter), [None, None]);
+    assert_eq!(index.total_tokens(), None);
+    assert_eq!(index.points_count(), 2);
+}
+
+/// The per-segment half of the corpus gather, over an index that records
+/// lengths.
+#[test]
+fn text_statistics_gather_sums_lengths_and_frequencies() {
+    use crate::data_types::query_context::TextFieldStats;
+    use crate::index::field_index::full_text_index::full_text_index_read::fill_text_statistics;
+
+    let scoring_dir = Builder::new().prefix("stats_scoring").tempdir().unwrap();
+    let index = two_document_mmap_index(scoring_dir.path().to_path_buf(), true);
+    let hw_counter = HardwareCounterCell::new();
+    let is_stopped = std::sync::atomic::AtomicBool::new(false);
+
+    let mut stats = TextFieldStats {
+        df: ["the", "alpha", "absent"]
+            .map(|term| (term.to_string(), 0))
+            .into(),
+        ..Default::default()
+    };
+    fill_text_statistics(&index, &mut stats, &is_stopped, &hw_counter).unwrap();
+
+    assert_eq!(stats.documents, 2);
+    assert_eq!(stats.total_tokens, Some(10), "3 tokens plus 7");
+    assert_eq!(stats.df["the"], 1, "repeats in one document are still one");
+    assert_eq!(stats.df["alpha"], 1);
+    assert_eq!(stats.df["absent"], 0);
+
+    // A segment that records no lengths poisons the average for the whole
+    // corpus rather than letting it be taken over the segments that do.
+    let plain_dir = Builder::new().prefix("stats_plain").tempdir().unwrap();
+    let plain = two_document_mmap_index(plain_dir.path().to_path_buf(), false);
+    fill_text_statistics(&plain, &mut stats, &is_stopped, &hw_counter).unwrap();
+
+    assert_eq!(stats.documents, 4);
+    assert_eq!(stats.df["the"], 2, "frequencies still sum");
+    assert_eq!(stats.total_tokens, None);
 }

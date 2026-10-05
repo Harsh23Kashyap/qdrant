@@ -48,7 +48,7 @@ mod qdrant_edge {
     use super::config::sparse_vector_data::{PyEdgeSparseVectorParams, PyModifier};
     #[pymodule_export]
     use super::config::vector_data::{
-        PyDistance, PyEdgeVectorParams, PyHnswIndexConfig, PyMultiVectorComparator,
+        PyDistance, PyEdgeVectorParams, PyHnswIndexConfig, PyMemory, PyMultiVectorComparator,
         PyMultiVectorConfig, PyPlainIndexConfig, PyVectorStorageDatatype,
     };
     #[pymodule_export]
@@ -59,7 +59,8 @@ mod qdrant_edge {
     use super::facet::{PyFacetHit, PyFacetRequest, PyFacetResponse};
     #[pymodule_export]
     use super::query::{
-        PyDirection, PyFusion, PyMmr, PyOrderBy, PyPrefetch, PyQueryRequest, PySample,
+        PyDirection, PyFusion, PyMmr, PyOrderBy, PyPrefetch, PyQueryBatchRequest, PyQueryRequest,
+        PySample,
     };
     #[pymodule_export]
     use super::scroll::PyScrollRequest;
@@ -72,9 +73,9 @@ mod qdrant_edge {
     use super::types::filter::{
         PyFieldCondition, PyFilter, PyGeoBoundingBox, PyGeoPoint, PyGeoPolygon, PyGeoRadius,
         PyHasIdCondition, PyHasVectorCondition, PyIsEmptyCondition, PyIsNullCondition, PyMatchAny,
-        PyMatchExcept, PyMatchPhrase, PyMatchPrefix, PyMatchText, PyMatchTextAny, PyMatchValue,
-        PyMinShould, PyNestedCondition, PyRangeDateTime, PyRangeFloat, PySliceCondition,
-        PyValuesCount,
+        PyMatchExcept, PyMatchPhrase, PyMatchPrefix, PyMatchSubstring, PyMatchText, PyMatchTextAny,
+        PyMatchValue, PyMinShould, PyNestedCondition, PyRangeDateTime, PyRangeFloat,
+        PySliceCondition, PyValuesCount,
     };
     #[pymodule_export]
     use super::types::formula::{PyDecayKind, PyExpressionInterface, PyFormula};
@@ -113,7 +114,7 @@ impl PyEdgeShard {
     }
 
     /// Create a new edge shard at `path` with the given configuration.
-    /// Fails if the path already contains segment data.
+    /// Creates `path` if it does not exist. Fails if the path already contains segment data.
     #[staticmethod]
     pub fn create(path: PathBuf, config: PyEdgeConfig) -> Result<Self> {
         let shard = edge::EdgeShard::new(&path, config.0)?;
@@ -148,10 +149,9 @@ impl PyEdgeShard {
     /// Execute several queries as one planned batch.
     ///
     /// Cheaper than one `query` per request: the batch shares a single pass over the segments.
-    /// Returns one result list per request, in the same order as `queries`.
-    pub fn query_batch(&self, queries: Vec<PyQueryRequest>) -> Result<Vec<Vec<PyScoredPoint>>> {
-        let requests = queries.into_iter().map(Into::into).collect();
-        let batches = self.get_shard()?.query_batch(requests)?;
+    /// Returns one result list per request, in the same order as `request.queries`.
+    pub fn query_batch(&self, request: PyQueryBatchRequest) -> Result<Vec<Vec<PyScoredPoint>>> {
+        let batches = self.get_shard()?.query_batch(request.into())?;
         Ok(batches.into_iter().map(PyScoredPoint::wrap_vec).collect())
     }
 

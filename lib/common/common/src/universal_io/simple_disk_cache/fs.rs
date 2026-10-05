@@ -12,7 +12,7 @@ use crate::universal_io::simple_disk_cache::REMOTE_OPEN_OPTIONS;
 use crate::universal_io::simple_disk_cache::local_state::LocalState;
 use crate::universal_io::{
     ListedFile, OpenExtra, OpenOptions, OwnedPipeline, Populate, UioResult, UniversalIoError,
-    UniversalRead, UniversalReadFileOps, UniversalReadFs,
+    UniversalRead, UniversalReadFs,
 };
 
 /// Construction context for [`DiskCacheFs`]: carries the
@@ -102,9 +102,14 @@ where
 
 impl<R: UniversalRead> DiskCacheFs<R> {
     /// Wrap an already-built remote filesystem handle. The config-driven
-    /// path is [`UniversalReadFileOps::from_context`].
+    /// path is [`UniversalReadFs::from_context`].
     pub fn new(config: Arc<DiskCacheConfig>, remote_fs: R::Fs) -> Self {
         Self { config, remote_fs }
+    }
+
+    /// The remote filesystem missing blocks are fetched from.
+    pub fn remote_fs(&self) -> &R::Fs {
+        &self.remote_fs
     }
 
     pub(super) fn open_remote(
@@ -117,30 +122,7 @@ impl<R: UniversalRead> DiskCacheFs<R> {
     }
 }
 
-impl<R> UniversalReadFileOps for DiskCacheFs<R>
-where
-    R: UniversalRead + 'static,
-{
-    type ContextConfig = DiskCacheFsContext<<R::Fs as UniversalReadFileOps>::ContextConfig>;
-
-    fn from_context(ctx: Self::ContextConfig) -> UioResult<Self> {
-        let DiskCacheFsContext { config, remote } = ctx;
-        Ok(Self {
-            config,
-            remote_fs: R::Fs::from_context(remote)?,
-        })
-    }
-
-    fn list_files(&self, prefix_path: &Path) -> UioResult<Vec<ListedFile>> {
-        self.remote_fs.list_files(prefix_path)
-    }
-
-    fn exists(&self, path: &Path) -> UioResult<bool> {
-        self.remote_fs.exists(path)
-    }
-}
-
-// Deliberately no `UniversalWriteFileOps` impl: the disk cache is strictly
+// Deliberately no `UniversalWriteFs` impl: the disk cache is strictly
 // read-only, at the filesystem level as much as at the file level (see the
 // `assert_not_impl_any!` on `DiskCache`). Mutations — creating, removing and
 // appending to files — go straight to the backing storage, whose handle the
@@ -168,6 +150,23 @@ where
 {
     type File = DiskCache<R>;
     type OpenExtra = DiskCacheFsOpenExtra<<R::Fs as UniversalReadFs>::OpenExtra>;
+    type ContextConfig = DiskCacheFsContext<<R::Fs as UniversalReadFs>::ContextConfig>;
+
+    fn from_context(ctx: Self::ContextConfig) -> UioResult<Self> {
+        let DiskCacheFsContext { config, remote } = ctx;
+        Ok(Self {
+            config,
+            remote_fs: R::Fs::from_context(remote)?,
+        })
+    }
+
+    fn list_files(&self, prefix_path: &Path) -> UioResult<Vec<ListedFile>> {
+        self.remote_fs.list_files(prefix_path)
+    }
+
+    fn exists(&self, path: &Path) -> UioResult<bool> {
+        self.remote_fs.exists(path)
+    }
 
     fn open(
         &self,
@@ -256,7 +255,7 @@ where
         };
 
         let cache = DiskCache::new(
-            self.remote_fs.clone(),
+            self,
             remote_extra,
             path.as_ref(),
             local_path,

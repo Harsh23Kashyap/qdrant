@@ -365,6 +365,7 @@ fn closed_shard_returns_shard_closed() {
             VectorDataConfig {
                 size: 4,
                 distance: Distance::Dot,
+                memory: None,
                 quantization_config: None,
                 multivector_config: None,
                 datatype: None,
@@ -372,6 +373,8 @@ fn closed_shard_returns_shard_closed() {
             },
         )]),
         sparse_vector_data: HashMap::new(),
+        payload_memory: None,
+        id_tracker_memory: None,
     };
 
     let shard: Arc<EdgeShard> =
@@ -785,6 +788,9 @@ fn text_match_variants_convert() {
         Match::Prefix {
             prefix: "ab".to_string(),
         },
+        Match::Substring {
+            substring: "ab".to_string(),
+        },
     ];
     let converted: Vec<SegmentMatch> = cases
         .into_iter()
@@ -793,6 +799,7 @@ fn text_match_variants_convert() {
     assert!(matches!(converted[0], SegmentMatch::TextAny(_)));
     assert!(matches!(converted[1], SegmentMatch::Phrase(_)));
     assert!(matches!(converted[2], SegmentMatch::Prefix(_)));
+    assert!(matches!(converted[3], SegmentMatch::Substring(_)));
 }
 
 #[test]

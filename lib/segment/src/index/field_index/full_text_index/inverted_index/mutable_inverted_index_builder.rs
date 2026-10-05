@@ -9,15 +9,19 @@ pub struct MutableInvertedIndexBuilder {
 }
 
 impl MutableInvertedIndexBuilder {
-    pub fn new(phrase_matching: bool) -> Self {
-        let index = MutableInvertedIndex::new(phrase_matching);
+    pub fn new(phrase_matching: bool, with_doc_len: bool) -> Self {
+        let index = MutableInvertedIndex::new(phrase_matching, with_doc_len);
         Self { index }
     }
 
-    /// Add a vector to the inverted index builder
-    pub fn add(&mut self, idx: PointOffsetType, str_tokens: impl IntoIterator<Item = String>) {
-        self.index.points_count += 1;
-
+    /// Add a vector to the inverted index builder. `doc_len` comes from the
+    /// stored record, never from `str_tokens`.
+    pub fn add(
+        &mut self,
+        idx: PointOffsetType,
+        str_tokens: impl IntoIterator<Item = String>,
+        doc_len: Option<u32>,
+    ) {
         // resize point_to_* structures if needed
         if self.index.point_to_tokens.len() <= idx as usize {
             self.index
@@ -28,6 +32,7 @@ impl MutableInvertedIndexBuilder {
                 point_to_doc.resize_with(idx as usize + 1, Default::default);
             }
         }
+        self.index.set_doc_len(idx, doc_len);
 
         let tokens = self.index.register_tokens(str_tokens);
 
@@ -38,6 +43,12 @@ impl MutableInvertedIndexBuilder {
 
         // insert as tokenset
         let tokens_set = TokenSet::from_iter(tokens);
+        // Same definition as `index_tokens`: a value that tokenizes to nothing
+        // is not a document. The builder visits each point once, so no
+        // transition tracking is needed here.
+        if !tokens_set.is_empty() {
+            self.index.points_count += 1;
+        }
         self.index.point_to_tokens[idx as usize] = Some(tokens_set);
     }
 

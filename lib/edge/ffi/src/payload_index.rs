@@ -686,13 +686,24 @@ impl TryFrom<PayloadIndexParams> for PayloadSchemaParams {
                     stemmer,
                     enable_hnsw,
                 } = config;
+                let min_token_len = token_len("min_token_len", min_token_len)?;
+                let max_token_len = token_len("max_token_len", max_token_len)?;
+                // Same rule the server enforces on its API: an inverted length
+                // window drops every token and the index builds empty.
+                segment_index::validate_text_index_params(&min_token_len, &max_token_len).map_err(
+                    |_| {
+                        EdgeError::invalid_argument(
+                            "text index: 'min_token_len' can't be greater than 'max_token_len'",
+                        )
+                    },
+                )?;
                 Ok(PayloadSchemaParams::Text(segment_index::TextIndexParams {
                     r#type: segment_index::TextIndexType::Text,
                     tokenizer: tokenizer
                         .map(segment_index::TokenizerType::from)
                         .unwrap_or_default(),
-                    min_token_len: token_len("min_token_len", min_token_len)?,
-                    max_token_len: token_len("max_token_len", max_token_len)?,
+                    min_token_len,
+                    max_token_len,
                     lowercase,
                     ascii_folding,
                     phrase_matching,
@@ -701,6 +712,8 @@ impl TryFrom<PayloadIndexParams> for PayloadSchemaParams {
                     memory: memory.map(SegmentMemory::from),
                     stemmer: stemmer.map(segment_index::StemmingAlgorithm::from),
                     enable_hnsw,
+                    // Not exposed: edge does not run BM25 over a text index yet.
+                    scoring: None,
                 }))
             }
             PayloadIndexParams::Bool { config } => {
@@ -853,6 +866,8 @@ impl From<PayloadSchemaParams> for PayloadIndexParams {
                     memory: _,
                     stemmer,
                     enable_hnsw,
+                    // Not exposed, see the conversion the other way.
+                    scoring: _,
                 } = params;
                 PayloadIndexParams::Text {
                     config: TextIndexParams {

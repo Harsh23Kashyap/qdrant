@@ -22,13 +22,50 @@ storage:
   snapshots_path: ./snapshots
 
   snapshots_config:
-    # "local" or "s3" - where to store snapshots
+    # Where to store snapshots: "local", "s3", "gcs" or "azure"
     snapshots_storage: local
+
+    # Amazon S3 or any S3-compatible storage. Fields left unset are resolved
+    # from the AWS_* environment and the default credential chain.
     # s3_config:
     #   bucket: ""
+    #   # Optional key prefix, objects become <prefix>/snapshots/...
+    #   prefix: ""
     #   region: ""
     #   access_key: ""
     #   secret_key: ""
+    #   # Custom endpoint, for MinIO and similar
+    #   endpoint_url: ""
+
+    # Google Cloud Storage. Without credential fields, Application Default
+    # Credentials are used: GOOGLE_* environment, gcloud config or the
+    # metadata server on GCE and GKE.
+    # gcs_config:
+    #   bucket: ""
+    #   # Optional object name prefix, objects become <prefix>/snapshots/...
+    #   prefix: ""
+    #   # Use at most one of the following
+    #   service_account_path: ""
+    #   service_account_key: ""
+    #   application_credentials_path: ""
+    #   # Custom endpoint, for fake-gcs-server and similar
+    #   endpoint_url: ""
+
+    # Azure Blob Storage. Without credential fields, the default chain is
+    # used: AZURE_* environment, managed identity or the Azure CLI.
+    # azure_config:
+    #   account: ""
+    #   container: ""
+    #   # Optional blob name prefix, blobs become <prefix>/snapshots/...
+    #   prefix: ""
+    #   # Use one authentication method
+    #   access_key: ""
+    #   sas_token: ""
+    #   client_id: ""
+    #   client_secret: ""
+    #   tenant_id: ""
+    #   # Custom endpoint, for Azurite and similar
+    #   endpoint_url: ""
 
   # Where to store temporary files
   # If null, temporary snapshots are stored in: storage/snapshots_temp/
@@ -391,7 +428,10 @@ service:
   #
   # jwt_rbac: true
 
-  # Enforce API key / JWT authentication on the internal (p2p) gRPC API.
+  # Enforce API key authentication on the internal (p2p) gRPC API.
+  # Only `api_key` and `alt_api_key` are accepted there; the read-only key
+  # and JWT tokens are rejected, since peers joining consensus and moving
+  # shards must hold the read-write key.
   # The regular api_key is always forwarded on internal requests, but the
   # receiving side only verifies it when this flag is enabled. Keep disabled
   # during a rolling upgrade so older peers (that do not attach a key yet)
@@ -424,6 +464,12 @@ cluster:
 
   # Configuration of the inter-cluster communication
   p2p:
+    # Host or IP address to bind the internal (p2p) gRPC listener to.
+    # Defaults to `service.host` when unset. Set this to an internal
+    # interface to keep the internal port off the interface that serves
+    # the public API.
+    #
+    # host: <internal IP of this node>
     # Port for internal communication between peers
     port: 6335
 
@@ -444,12 +490,6 @@ cluster:
     # replaying a huge amount of operations.
     # If 0 - disable compaction
     compact_wal_entries: 128
-
-    # Apply every consensus operation to an in-memory state machine as well, and
-    # compare its state against the applied one, to validate the state machine
-    # against the implementation it is going to replace. One of `disabled`,
-    # `log` the difference, or `panic` on it.
-    shadow_state_machine: disabled
 
 # Set to true to prevent service from sending usage statistics to the developers.
 # Read more: https://qdrant.tech/documentation/guides/telemetry

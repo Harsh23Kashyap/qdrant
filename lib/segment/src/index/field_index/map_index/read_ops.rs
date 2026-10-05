@@ -22,7 +22,7 @@ use crate::telemetry::PayloadIndexTelemetry;
 /// Read-only operations supported by every map-index storage variant
 /// ([`super::mutable_map_index::MutableMapIndex`],
 /// [`super::immutable_map_index::ImmutableMapIndex`],
-/// [`super::universal_map_index::UniversalMapIndex`]).
+/// [`super::on_disk_map_index::OnDiskMapIndex`]).
 ///
 /// Signatures are unified across variants so the enum-level dispatcher in
 /// [`MapIndex`] can call them generically. Variants that don't need
@@ -274,6 +274,19 @@ pub trait MapIndexRead<'a, N: MapIndexKey + ?Sized + 'a>: Sized {
             index: self,
             hw_counter,
             predicate: MapPredicate::Prefix(<N as MapIndexKey>::to_owned(prefix.borrow())),
+        }
+    }
+
+    /// Condition checker for [`crate::types::Match::Substring`].
+    fn match_substring_checker(
+        &'a self,
+        hw_counter: HardwareCounterCell,
+        substring: impl Borrow<N>,
+    ) -> MapConditionChecker<'a, N, Self> {
+        MapConditionChecker {
+            index: self,
+            hw_counter,
+            predicate: MapPredicate::Substring(<N as MapIndexKey>::to_owned(substring.borrow())),
         }
     }
 
@@ -561,6 +574,9 @@ enum MapPredicate<N: MapIndexKey + ?Sized> {
     /// For [`crate::types::Match::Prefix`]; meaningful for string keys only
     /// ([`MapIndexKey::starts_with`] is constant `false` elsewhere).
     Prefix(<N as MapIndexKey>::Owned),
+    /// For [`crate::types::Match::Substring`]; meaningful for string keys only
+    /// ([`MapIndexKey::contains`] is constant `false` elsewhere).
+    Substring(<N as MapIndexKey>::Owned),
     /// For [`crate::types::Match::Any`] and [`crate::types::Match::Except`],
     /// Linear scan version.
     AnyScan {
@@ -610,6 +626,7 @@ impl<'a, N: MapIndexKey + ?Sized + 'a, T> MapConditionChecker<'a, N, T> {
         match &self.predicate {
             MapPredicate::Value(expected) => value == expected.borrow(),
             MapPredicate::Prefix(prefix) => N::starts_with(value, prefix.borrow()),
+            MapPredicate::Substring(substring) => N::contains(value, substring.borrow()),
             MapPredicate::AnyScan { list, negate } => {
                 list.iter().any(|key| key.borrow() == value) != *negate
             }

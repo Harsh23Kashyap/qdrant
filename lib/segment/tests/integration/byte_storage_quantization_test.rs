@@ -268,7 +268,7 @@ fn test_quantization_over_typed_storage_hnsw(
     let stopped = AtomicBool::new(false);
 
     let m = 8;
-    let num_vectors: u64 = 5_000;
+    let num_vectors: u64 = 2_000;
     let ef_construct = 16;
     let full_scan_threshold = 16; // KB
     let num_payload_values = 2;
@@ -441,6 +441,7 @@ fn test_quantization_over_typed_storage_hnsw(
             stopped: &stopped,
             hnsw_global_config: &HnswGlobalConfig::default(),
             feature_flags: FeatureFlags::default(),
+            inline_vectors: false,
             progress: ProgressTracker::new_for_test(),
         },
     )

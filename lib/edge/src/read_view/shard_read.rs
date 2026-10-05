@@ -10,11 +10,11 @@ use shard::retrieve::record_internal::RecordInternal;
 use super::{EdgeReadView, Group, ReadSegmentHandle, SearchMatrixResponse, ShardInfo};
 use crate::EdgeConfig;
 use crate::requests::{
-    CountRequest, FacetRequest, GroupRequest, QueryRequest, RetrieveRequest, ScrollRequest,
-    SearchMatrixRequest, SearchRequest,
+    CountRequest, FacetRequest, GroupRequest, QueryBatchRequest, QueryRequest, RetrieveRequest,
+    ScrollRequest, SearchMatrixRequest, SearchRequest,
 };
 
-mod sealed {
+pub(super) mod sealed {
     /// Empty marker supertrait of [`EdgeShardRead`](super::EdgeShardRead). Unnameable outside the
     /// crate, so downstream crates cannot implement `EdgeShardRead`; it carries no methods, so
     /// nothing internal becomes callable through it.
@@ -71,7 +71,7 @@ pub trait EdgeShardRead: sealed::Sealed {
     /// query vector are pushed down to each segment as one multi-vector search.
     ///
     /// Returns one result list per request, in request order.
-    fn query_batch(&self, requests: Vec<QueryRequest>) -> OperationResult<Vec<Vec<ScoredPoint>>>;
+    fn query_batch(&self, request: QueryBatchRequest) -> OperationResult<Vec<Vec<ScoredPoint>>>;
 
     fn scroll(
         &self,
@@ -108,8 +108,9 @@ impl<T: ReadViewProvider + ?Sized> EdgeShardRead for T {
         view(self).query(request.into())
     }
 
-    fn query_batch(&self, requests: Vec<QueryRequest>) -> OperationResult<Vec<Vec<ScoredPoint>>> {
-        view(self).query_batch(requests.into_iter().map(Into::into).collect())
+    fn query_batch(&self, request: QueryBatchRequest) -> OperationResult<Vec<Vec<ScoredPoint>>> {
+        let QueryBatchRequest { queries } = request;
+        view(self).query_batch(queries.into_iter().map(Into::into).collect())
     }
 
     fn scroll(
@@ -151,7 +152,7 @@ impl<T: ReadViewProvider + ?Sized> EdgeShardRead for T {
 
 /// Build a one-shot read snapshot for a shard. Private so it is not part of the trait's surface —
 /// the snapshot is an implementation detail of the blanket [`EdgeShardRead`] impl.
-fn view<T: ReadViewProvider + ?Sized>(shard: &T) -> EdgeReadView<T::Handle> {
+pub(super) fn view<T: ReadViewProvider + ?Sized>(shard: &T) -> EdgeReadView<T::Handle> {
     EdgeReadView::new(
         shard.read_segments(),
         shard.config_snapshot(),

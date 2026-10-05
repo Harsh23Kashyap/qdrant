@@ -6,15 +6,16 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use common::universal_io::{MmapFs, Populate};
 use itertools::Itertools as _;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use super::immutable_text_index::ImmutableFullTextIndex;
 use super::inverted_index::ARRAY_BOUNDARY_SENTINEL;
+use super::inverted_index::on_disk_inverted_index::has_doc_len_sidecar;
 use super::mutable_text_index::MutableFullTextIndex;
 use super::on_disk_text_index::{FullTextMmapIndexBuilder, OnDiskFullTextIndex};
 use super::tokenizers::Tokenizer;
-use super::{FullTextGridstoreIndexBuilder, FullTextIndex};
+use super::{FullTextGridstoreIndexBuilder, FullTextIndex, StoredDocument};
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::index::TextIndexParams;
@@ -35,11 +36,36 @@ impl FullTextIndex {
         let memory = memory.clamp_to_low_memory();
 
         let populate = Populate::from(memory.populate_on_open());
+        let scoring = config.scoring();
+
+        // Checked before the open, not after: opening populates the whole file
+        // set, and on the first start after scoring is enabled every existing
+        // segment would fault in its postings only to be discarded here.
+        if scoring && !has_doc_len_sidecar(&MmapFs, &path)? {
+            log::info!(
+                "Text index at {path} records no document lengths, rebuilding it from payload",
+                path = path.display(),
+            );
+            return Ok(None);
+        }
+
         let Some(on_disk_index) =
             OnDiskFullTextIndex::open(&MmapFs, path, config, populate, deleted_points)?
         else {
             return Ok(None);
         };
+
+        // Lengths cannot be recovered from anything else on disk, so report the
+        // index absent and let the caller rebuild it from payload. The decision
+        // belongs here rather than in `OnDiskInvertedIndex::open`: the read-only
+        // stack never builds, and would drop the field instead.
+        //
+        // Reachable past the probe above when the sidecar exists but `open`
+        // rejected it, so the log says which of the two happened.
+        if scoring && !on_disk_index.records_doc_len() {
+            log::info!("Text index rejected its document length sidecar, rebuilding from payload");
+            return Ok(None);
+        }
 
         let index = if memory.is_heap() {
             // Load into RAM, use mmap as backing storage
@@ -56,7 +82,8 @@ impl FullTextIndex {
         config: TextIndexParams,
         create_if_missing: bool,
     ) -> OperationResult<Option<Self>> {
-        let index = MutableFullTextIndex::open_gridstore(dir, config, create_if_missing)?;
+        let scoring = config.scoring();
+        let index = MutableFullTextIndex::open_gridstore(dir, config, create_if_missing, scoring)?;
         Ok(index.map(Self::Mutable))
     }
 
@@ -79,15 +106,17 @@ impl FullTextIndex {
         config: TextIndexParams,
         is_on_disk: bool,
         deleted_points: &BitSlice,
+        scoring: bool,
     ) -> FullTextMmapIndexBuilder {
-        FullTextMmapIndexBuilder::new(path, config, is_on_disk, deleted_points)
+        FullTextMmapIndexBuilder::new(path, config, is_on_disk, deleted_points, scoring)
     }
 
     pub fn builder_gridstore(
         dir: PathBuf,
         config: TextIndexParams,
+        scoring: bool,
     ) -> FullTextGridstoreIndexBuilder {
-        FullTextGridstoreIndexBuilder::new(dir, config)
+        FullTextGridstoreIndexBuilder::new(dir, config, scoring)
     }
 
     /// Tokenize a point's text values into the token stream the index is built
@@ -116,6 +145,24 @@ impl FullTextIndex {
         str_tokens
     }
 
+    /// Number of tokens in a document, for BM25 length normalization.
+    ///
+    /// Discounts the boundaries [`Self::tokenize_document`] inserted by count
+    /// rather than by value: `tokenize_doc` does not strip the sentinel from
+    /// user text the way `tokenize_query` does, so a payload containing it has
+    /// those tokens indexed, and they must be counted.
+    pub(super) fn document_length(
+        str_tokens: &[Cow<str>],
+        phrase_matching: bool,
+        values: &[String],
+    ) -> u32 {
+        let boundaries = match phrase_matching && values.len() > 1 {
+            true => values.len() - 1,
+            false => 0,
+        };
+        str_tokens.len().saturating_sub(boundaries) as u32
+    }
+
     /// Encode a point's tokens as the document the storage holds.
     ///
     /// Phrase matching needs them in the order they were written; without it
@@ -123,6 +170,7 @@ impl FullTextIndex {
     pub(super) fn serialize_stored_document(
         str_tokens: Vec<Cow<str>>,
         phrase_matching: bool,
+        doc_len: Option<u32>,
     ) -> OperationResult<Vec<u8>> {
         let tokens = if phrase_matching {
             str_tokens
@@ -130,30 +178,29 @@ impl FullTextIndex {
             str_tokens.into_iter().sorted().dedup().collect()
         };
 
-        Self::serialize_document(tokens)
+        Self::serialize_document(tokens, doc_len)
     }
 
-    pub(super) fn serialize_document(tokens: Vec<Cow<str>>) -> OperationResult<Vec<u8>> {
+    pub(super) fn serialize_document(
+        tokens: Vec<Cow<str>>,
+        doc_len: Option<u32>,
+    ) -> OperationResult<Vec<u8>> {
         #[derive(Serialize)]
-        struct StoredDocument<'a> {
+        struct StoredDocumentRef<'a> {
             tokens: Vec<Cow<'a, str>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            doc_len: Option<u32>,
         }
-        let doc = StoredDocument { tokens };
+        let doc = StoredDocumentRef { tokens, doc_len };
         serde_cbor::to_vec(&doc).map_err(|e| {
             OperationError::service_error(format!("Failed to serialize document: {e}"))
         })
     }
 
-    pub(super) fn deserialize_document(data: &[u8]) -> OperationResult<Vec<String>> {
-        #[derive(Deserialize)]
-        struct StoredDocument {
-            tokens: Vec<String>,
-        }
-        serde_cbor::from_slice::<StoredDocument>(data)
-            .map_err(|e| {
-                OperationError::service_error(format!("Failed to deserialize document: {e}"))
-            })
-            .map(|doc| doc.tokens)
+    pub(super) fn deserialize_document(data: &[u8]) -> OperationResult<StoredDocument> {
+        serde_cbor::from_slice::<StoredDocument>(data).map_err(|e| {
+            OperationError::service_error(format!("Failed to deserialize document: {e}"))
+        })
     }
 
     pub fn get_mutability_type(&self) -> IndexMutability {
@@ -259,11 +306,20 @@ impl PayloadFieldIndex for FullTextIndex {
 }
 
 impl FullTextGridstoreIndexBuilder {
-    pub fn new(dir: PathBuf, config: TextIndexParams) -> Self {
+    pub fn new(dir: PathBuf, config: TextIndexParams, scoring: bool) -> Self {
         Self {
             dir,
             config,
+            scoring,
             index: None,
+        }
+    }
+
+    /// Don't journal the value mappings of the built index, see
+    /// [`Blobstore::disable_journal`](blobstore::Blobstore::disable_journal). Call after `init`.
+    pub(crate) fn disable_journal(&mut self) {
+        if let Some(FullTextIndex::Mutable(index)) = &mut self.index {
+            index.storage.disable_journal();
         }
     }
 }
@@ -304,15 +360,18 @@ impl FieldIndexBuilderTrait for FullTextGridstoreIndexBuilder {
             self.index.is_none(),
             "index must be initialized exactly once",
         );
-        self.index.replace(
-            FullTextIndex::new_gridstore(self.dir.clone(), self.config.clone(), true)?.ok_or_else(
-                || {
-                    OperationError::service_error(
-                        "Failed to create and open mutable full text index on gridstore",
-                    )
-                },
-            )?,
-        );
+        let index = MutableFullTextIndex::open_gridstore(
+            self.dir.clone(),
+            self.config.clone(),
+            true,
+            self.scoring,
+        )?
+        .ok_or_else(|| {
+            OperationError::service_error(
+                "Failed to create and open mutable full text index on gridstore",
+            )
+        })?;
+        self.index.replace(FullTextIndex::Mutable(index));
         Ok(())
     }
 

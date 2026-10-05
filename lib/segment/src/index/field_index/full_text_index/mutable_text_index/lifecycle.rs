@@ -6,8 +6,8 @@ use common::types::PointOffsetType;
 use common::universal_io::{MmapFs, Populate};
 
 use super::super::FullTextIndex;
+use super::super::inverted_index::InvertedIndex;
 use super::super::inverted_index::mutable_inverted_index_builder::MutableInvertedIndexBuilder;
-use super::super::inverted_index::{Document, InvertedIndex, TokenSet};
 use super::super::tokenizers::Tokenizer;
 use super::inner::MutableFullTextIndexInner;
 use super::{MutableFullTextIndex, storage_options};
@@ -26,17 +26,18 @@ impl MutableFullTextIndex {
         path: PathBuf,
         config: TextIndexParams,
         create_if_missing: bool,
+        scoring: bool,
     ) -> OperationResult<Option<Self>> {
+        // Only for the message below: the store takes the path by value.
         let store = if create_if_missing {
-            Blobstore::open_or_create(MmapFs, path, storage_options(), Populate::Blocking).map_err(
-                |err| {
-                    OperationError::service_error(format!(
-                        "failed to open mutable full text index on gridstore: {err}"
-                    ))
-                },
-            )?
+            Blobstore::open_or_create(MmapFs, path.clone(), storage_options(), Populate::Blocking)
+                .map_err(|err| {
+                OperationError::service_error(format!(
+                    "failed to open mutable full text index on gridstore: {err}"
+                ))
+            })?
         } else if path.exists() {
-            Blobstore::open(MmapFs, path, Populate::Blocking).map_err(|err| {
+            Blobstore::open(MmapFs, path.clone(), Populate::Blocking).map_err(|err| {
                 OperationError::service_error(format!(
                     "failed to open mutable full text index on gridstore: {err}"
                 ))
@@ -52,13 +53,17 @@ impl MutableFullTextIndex {
         let hw_counter = HardwareCounterCell::disposable();
         let hw_counter_ref = hw_counter.ref_payload_index_io_write_counter();
 
-        let mut builder = MutableInvertedIndexBuilder::new(phrase_matching);
+        let mut builder = MutableInvertedIndexBuilder::new(phrase_matching, scoring);
+        let mut records_without_length = 0usize;
 
         store
             .iter::<_, OperationError>(
                 |idx, value: Vec<u8>| {
-                    let str_tokens = FullTextIndex::deserialize_document(&value)?;
-                    builder.add(idx, str_tokens);
+                    let doc = FullTextIndex::deserialize_document(&value)?;
+                    if scoring && doc.doc_len.is_none() {
+                        records_without_length += 1;
+                    }
+                    builder.add(idx, doc.tokens, doc.doc_len);
                     Ok(true)
                 },
                 hw_counter_ref,
@@ -68,6 +73,20 @@ impl MutableFullTextIndex {
                     "Failed to load mutable full text index from gridstore: {err}"
                 ))
             })?;
+
+        // The builder stores a zero for a record without a length, which the
+        // accessors would then serve as a real length of zero. Lengths cannot
+        // be recovered from the records, so report the index absent and let
+        // the caller rebuild it from payload, as `new_mmap` does for a missing
+        // sidecar.
+        if records_without_length > 0 {
+            log::info!(
+                "Text index at {path} has {records_without_length} records without a document \
+                 length, rebuilding it from payload",
+                path = path.display(),
+            );
+            return Ok(None);
+        }
 
         Ok(Some(Self {
             inner: MutableFullTextIndexInner {
@@ -127,21 +146,20 @@ impl MutableFullTextIndex {
         let str_tokens =
             FullTextIndex::tokenize_document(&self.inner.tokenizer, phrase_matching, &values);
 
-        let tokens = self.inner.inverted_index.register_tokens(&str_tokens);
+        // Measured here, before `serialize_stored_document` may deduplicate the
+        // stream: this is the only place that still sees every token.
+        let doc_len = self
+            .inner
+            .inverted_index
+            .records_doc_len()
+            .then(|| FullTextIndex::document_length(&str_tokens, phrase_matching, &values));
 
-        if phrase_matching {
-            let document = Document::new(tokens.clone());
-            self.inner
-                .inverted_index
-                .index_document(idx, document, hw_counter)?;
-        }
-
-        let token_set = TokenSet::from_iter(tokens);
         self.inner
             .inverted_index
-            .index_tokens(idx, token_set, hw_counter)?;
+            .index_str_tokens(idx, &str_tokens, doc_len, hw_counter)?;
 
-        let db_document = FullTextIndex::serialize_stored_document(str_tokens, phrase_matching)?;
+        let db_document =
+            FullTextIndex::serialize_stored_document(str_tokens, phrase_matching, doc_len)?;
 
         // Update persisted storage
         self.storage
@@ -168,6 +186,16 @@ impl MutableFullTextIndex {
         Ok(())
     }
 
+    /// Get the length stored for a given point ID. Only for testing purposes.
+    #[cfg(test)]
+    pub fn get_doc_len(&self, idx: PointOffsetType) -> Option<u32> {
+        use common::generic_consts::Random;
+        self.storage
+            .get_value::<Random>(idx, &HardwareCounterCell::disposable())
+            .unwrap()
+            .and_then(|bytes| FullTextIndex::deserialize_document(&bytes).unwrap().doc_len)
+    }
+
     /// Get the tokenized document stored for a given point ID. Only for testing purposes.
     #[cfg(test)]
     pub fn get_doc(&self, idx: PointOffsetType) -> Option<Vec<String>> {
@@ -175,7 +203,7 @@ impl MutableFullTextIndex {
         self.storage
             .get_value::<Random>(idx, &HardwareCounterCell::disposable())
             .unwrap()
-            .map(|bytes| FullTextIndex::deserialize_document(&bytes).unwrap())
+            .map(|bytes| FullTextIndex::deserialize_document(&bytes).unwrap().tokens)
     }
 }
 

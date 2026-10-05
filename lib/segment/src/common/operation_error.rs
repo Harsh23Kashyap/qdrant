@@ -251,7 +251,7 @@ impl From<UniversalIoError> for OperationError {
             | UniversalIoError::AppendRewriteRequired { .. }
             | UniversalIoError::AppendEntityTooSmall { .. }
             | UniversalIoError::AppendEtagMismatch { .. }
-            | UniversalIoError::S3(_)
+            | UniversalIoError::S3 { .. }
             | UniversalIoError::S3Config { .. }
             | UniversalIoError::TaskPanicked(_) => Self::service_error(err.to_string()),
         }
@@ -379,14 +379,16 @@ impl From<BlobstoreError> for OperationError {
                 | UniversalIoError::AppendRewriteRequired { .. }
                 | UniversalIoError::AppendEntityTooSmall { .. }
                 | UniversalIoError::AppendEtagMismatch { .. }
-                | UniversalIoError::S3(_)
+                | UniversalIoError::S3 { .. }
                 | UniversalIoError::S3Config { .. }
                 | UniversalIoError::TaskPanicked(_)) => {
                     Self::service_error(format!("Gridstore IO error: {err}"))
                 }
             },
-            BlobstoreError::PageNotFound { .. } => Self::service_error(err.to_string()),
-            BlobstoreError::ValueNotFound { .. } => Self::service_error(err.to_string()),
+            BlobstoreError::PageNotFound { .. }
+            | BlobstoreError::PageRangeNotFound { .. }
+            | BlobstoreError::ValueNotFound { .. }
+            | BlobstoreError::DecodeError { .. } => Self::service_error(err.to_string()),
         }
     }
 }

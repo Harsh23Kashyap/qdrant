@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::flags::FeatureFlags;
 use sparse::common::sparse_vector::SparseVector;
 use tempfile::Builder;
 
@@ -113,8 +114,13 @@ fn build_immutable_segment_with_data(
     };
     assert!(!target_config.is_appendable());
 
-    let mut builder =
-        SegmentBuilder::new(temp_path, &target_config, &HnswGlobalConfig::default()).unwrap();
+    let mut builder = SegmentBuilder::new(
+        temp_path,
+        &target_config,
+        &HnswGlobalConfig::default(),
+        FeatureFlags::default(),
+    )
+    .unwrap();
 
     let stopped = AtomicBool::new(false);
     builder.update(&[&source], &stopped, &hw()).unwrap();
@@ -423,7 +429,7 @@ fn test_persistence_after_create_with_data() {
     drop(segment);
 
     let stopped = AtomicBool::new(false);
-    let loaded = load_segment(&segment_path, segment_uuid, None, &stopped).unwrap();
+    let loaded = load_segment(&segment_path, segment_uuid, None, &stopped, false).unwrap();
 
     // Config persisted
     assert_eq!(loaded.segment_config.vector_data["persisted"].size, new_dim);
@@ -527,7 +533,7 @@ fn check_recreate_does_not_resurrect(
     drop(segment);
 
     let stopped = AtomicBool::new(false);
-    let loaded = load_segment(&segment_path, segment_uuid, None, &stopped).unwrap();
+    let loaded = load_segment(&segment_path, segment_uuid, None, &stopped, false).unwrap();
     let v2 = loaded.vector("v2", new_point, &hw).unwrap();
     assert!(
         v2.is_none(),
@@ -577,7 +583,7 @@ fn test_persistence_after_delete_with_data() {
     drop(segment);
 
     let stopped = AtomicBool::new(false);
-    let loaded = load_segment(&segment_path, segment_uuid, None, &stopped).unwrap();
+    let loaded = load_segment(&segment_path, segment_uuid, None, &stopped, false).unwrap();
 
     assert!(!loaded.segment_config.vector_data.contains_key("temp"));
     assert_eq!(loaded.available_point_count(), NUM_POINTS + 1);

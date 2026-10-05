@@ -10,7 +10,7 @@ use serde_json::Value;
 use tempfile::{Builder, TempDir};
 
 use crate::common::operation_error::OperationResult;
-use crate::data_types::index::TextIndexParams;
+use crate::data_types::index::{TextIndexParams, TextScoringParams};
 use crate::fixtures::payload_fixtures::random_full_text_payload;
 use crate::index::field_index::field_index_base::{PayloadFieldIndex, PayloadFieldIndexRead};
 use crate::index::field_index::full_text_index::full_text_index_read::FullTextIndexRead;
@@ -89,18 +89,21 @@ fn create_builder(
         IndexType::Mutable => IndexBuilder::Mutable(FullTextIndex::builder_gridstore(
             temp_dir.path().to_path_buf(),
             config,
+            true,
         )),
         IndexType::OnDisk => IndexBuilder::OnDisk(FullTextIndex::builder_mmap(
             temp_dir.path().to_path_buf(),
             config,
             true,
             &empty_deleted,
+            true,
         )),
         IndexType::Immutable => IndexBuilder::Immutable(FullTextIndex::builder_mmap(
             temp_dir.path().to_path_buf(),
             config,
             false,
             &empty_deleted,
+            true,
         )),
     };
     match &mut builder {
@@ -119,8 +122,11 @@ fn reopen_index(
     phrase_matching: bool,
     num_points: usize,
 ) -> FullTextIndex {
+    // The builders record lengths, so the reopen asks for them too: without
+    // `scoring` the gridstore reopen would record none.
     let config = TextIndexParams {
         phrase_matching: Some(phrase_matching),
+        scoring: Some(TextScoringParams::default()),
         ..TextIndexParams::default()
     };
 
@@ -326,6 +332,30 @@ fn test_congruence(
             assert_eq!(
                 index_a.values_is_empty(point_id),
                 index_b.values_is_empty(point_id),
+            );
+        }
+
+        // Every shape answers the same length for every point, deleted ones
+        // included, and the same total without deletions: the on-disk total
+        // is the build-time one. Before and after a reopen.
+        {
+            let total_a = index_a.total_tokens();
+            assert!(total_a.is_some(), "{type_a:?} recorded no lengths");
+            if !deleted {
+                assert_eq!(total_a, index_b.total_tokens());
+            }
+            let point_ids: Vec<PointOffsetType> = (0..POINT_COUNT as PointOffsetType).collect();
+            let doc_lens = |index: &FullTextIndex| {
+                let mut out = vec![None; point_ids.len()];
+                index
+                    .doc_len_batch(&point_ids, &hw_counter, |at, doc_len| out[at] = doc_len)
+                    .unwrap();
+                out
+            };
+            assert_eq!(
+                doc_lens(index_a),
+                doc_lens(index_b),
+                "doc_len_batch differs between {type_a:?} and {type_b:?}",
             );
         }
 
@@ -616,4 +646,71 @@ fn test_phrase_matching_single_element_array(
     let mut results: Vec<_> = index.filter_query(q, &hw).unwrap().collect();
     results.sort();
     assert_eq!(results, vec![1, 2, 3]);
+}
+
+/// A value that tokenizes to nothing is indexed, matches nothing, and is not a
+/// document. Every shape has to agree on that: `points_count` is `N` in the IDF
+/// formula and the divisor behind `avgdl`, so a definition that moves with the
+/// storage placement would make a document's score depend on whether its
+/// segment had been optimized yet.
+#[rstest]
+fn a_value_without_tokens_is_not_a_document(#[values(false, true)] phrase_matching: bool) {
+    let hw_counter = HardwareCounterCell::new();
+    let payloads = [
+        Value::String("alpha beta".to_string()),
+        // Punctuation only: indexed, but no tokens survive.
+        Value::String("!!! ???".to_string()),
+        Value::String("gamma".to_string()),
+    ];
+
+    let mut built = Vec::new();
+    for index_type in TYPES {
+        let (mut builder, temp_dir, _db) = create_builder(*index_type, phrase_matching);
+        for (idx, payload) in payloads.iter().enumerate() {
+            builder
+                .add_point(idx as PointOffsetType, &[payload], &hw_counter)
+                .unwrap();
+        }
+        built.push((builder.finalize().unwrap(), temp_dir, *index_type));
+    }
+
+    for (index, _temp_dir, index_type) in &built {
+        assert!(
+            index.values_is_empty(1),
+            "{index_type:?} indexed a token for a punctuation-only value",
+        );
+        assert_eq!(
+            index.points_count(),
+            2,
+            "{index_type:?} counts a value without tokens as a document",
+        );
+    }
+}
+
+/// Removing a value that was never counted must not decrement the count. The
+/// mutable index is the only shape that can remove, and its `remove` used to
+/// decrement for every point it found.
+#[rstest]
+fn removing_a_value_without_tokens_keeps_the_count(#[values(false, true)] phrase_matching: bool) {
+    let hw_counter = HardwareCounterCell::new();
+    let (mut builder, _temp_dir, _db) = create_builder(IndexType::Mutable, phrase_matching);
+    for (idx, payload) in [
+        Value::String("alpha beta".to_string()),
+        Value::String("!!! ???".to_string()),
+    ]
+    .iter()
+    .enumerate()
+    {
+        builder
+            .add_point(idx as PointOffsetType, &[payload], &hw_counter)
+            .unwrap();
+    }
+    let mut index = builder.finalize().unwrap();
+    assert_eq!(index.points_count(), 1);
+
+    index.remove_point(1).unwrap();
+    assert_eq!(index.points_count(), 1, "the empty value was never counted");
+
+    index.remove_point(0).unwrap();
+    assert_eq!(index.points_count(), 0);
 }

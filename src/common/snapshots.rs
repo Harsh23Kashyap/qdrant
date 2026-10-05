@@ -8,7 +8,7 @@ use collection::operations::snapshot_ops::{
 };
 use collection::operations::verification::VerificationPass;
 use collection::shards::replica_set::replica_set_state::ReplicaState;
-use collection::shards::shard::ShardId;
+use collection::shards::shard::{PeerId, ShardId};
 use collection::shards::shard_holder::recovery_guard::RecoveryProgressHandle;
 use collection::shards::shard_holder::shard_not_found_error;
 use collection::shards::transfer::RecoveryStage;
@@ -167,6 +167,7 @@ pub async fn recover_shard_snapshot(
     checksum: Option<String>,
     client: HttpClient,
     api_key: Option<String>,
+    from_peer_id: Option<PeerId>,
 ) -> Result<(), StorageError> {
     let collection_pass = auth
         .check_global_access(AccessRequirements::new().manage(), "recover_shard_snapshot")?
@@ -207,7 +208,7 @@ pub async fn recover_shard_snapshot(
         // URL recovery, where the shard may still be active.
         if matches!(snapshot_priority, SnapshotPriority::ShardTransfer) {
             collection
-                .clear_local_shard_for_snapshot_recovery(shard_id)
+                .clear_local_shard_for_snapshot_recovery(shard_id, from_peer_id)
                 .await?;
         }
 
@@ -235,6 +236,7 @@ pub async fn recover_shard_snapshot(
                         &download_dir,
                         collection.snapshots_path(),
                         checksum.is_some(),
+                        Some(recovery_guard.progress_handle()),
                     )
                     .await?
                 }
@@ -353,8 +355,7 @@ pub async fn recover_shard_snapshot_impl(
         .await?
         .await?;
 
-    // A partial recovery rewrites the payload index schema of the collection, which is part of
-    // the state consensus decides on, without an operation asking for it
+    // Partial snapshot recovery changes payload schema without a consensus operation
     if recovery_type.is_partial() {
         toc.mark_collection_dirty(collection.name());
     }

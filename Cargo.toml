@@ -1,6 +1,6 @@
 [package]
 name = "qdrant"
-version = "1.19.2-dev"
+version = "1.19.3-dev"
 description = "Qdrant - Vector Search engine"
 authors = [
     "Andrey Vasnetsov <andrey@vasnetsov.com>",
@@ -225,6 +225,7 @@ data-encoding = "2.11.0"
 duplicate = { version = "2.0.1", default-features = false }
 ecow = { version = "0.3.0", features = ["serde"] }
 env_logger = "0.11"
+exhaustive = "0.2.2"
 fnv = "1.0"
 fs4 = "1.1.0"
 fs-err = { version = "3.3.0", features = ["tokio"] }
@@ -246,6 +247,7 @@ indicatif = { version = "0.18.4", features = ["rayon"] }
 integer-encoding = "4.1.0"
 itertools = "0.15.0"
 log = "0.4.31"
+memchr = "2.8.0"
 memmap2 = "0.9.10"
 mockito = "1.7"
 murmur3_32 = "0.1"
@@ -274,7 +276,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
     "rustls",
     "blocking",
 ] }
-rstest = { version = "0.26.1", default-features = false }
+rstest = { version = "0.27.0", default-features = false }
 schemars = { version = "0.8.22", features = [
     "uuid1",
     "preserve_order",
@@ -315,6 +317,7 @@ bitvec = "1.0.1"
 smallvec = { version = "1.15.1", features = ["write"] }
 dashmap = "6.2"
 walkdir = "2.5.0"
+zstd = "0.13"
 
 [patch.crates-io]
 tonic = { git = "https://github.com/qdrant/tonic", branch = "v0.14.6-qdrant" }
@@ -404,6 +407,7 @@ inherits = "release"
 debug-assertions = true
 lto = false
 opt-level = 0
+codegen-units = 256 # restore default value for faster compilation
 
 # Inherits by default from release
 [profile.bench]

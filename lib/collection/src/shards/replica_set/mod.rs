@@ -20,6 +20,7 @@ use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::save_on_disk::SaveOnDisk;
 use common::types::DeferredBehavior;
 use replica_set_state::{ReplicaSetState, ReplicaState};
+use segment::pending_changes::PersistedProxyChanges;
 use segment::types::{ExtendedPointId, Filter, SeqNumberType, ShardKey, StrictModeConfig};
 use serde::{Deserialize, Serialize};
 use shard::operations::optimization::{
@@ -50,7 +51,8 @@ use crate::shards::dummy_shard::DummyShard;
 use crate::shards::replica_set::clock_set::ClockSet;
 use crate::shards::shard::{PeerId, Shard, ShardId};
 use crate::shards::shard_config::ShardConfig;
-use crate::shards::shard_trait::WaitUntil;
+use crate::shards::shard_initializing_flag_path;
+use crate::shards::shard_trait::{ShardOperation as _, WaitUntil};
 
 //    │    Collection Created
 //    │
@@ -304,6 +306,7 @@ impl ShardReplicaSet {
                     shared_storage_config.clone(),
                     payload_index_schema.clone(),
                     true,
+                    PersistedProxyChanges::Replay,
                     update_runtime.clone(),
                     search_runtime.clone(),
                     optimizer_resource_budget.clone(),
@@ -388,6 +391,18 @@ impl ShardReplicaSet {
         use crate::shards::shard::Shard;
         if let Some(Shard::Local(local)) = &*self.local.read().await {
             local.full_flush();
+        }
+    }
+
+    /// The local shard's segments, for the model tester to inspect their layout.
+    #[cfg(feature = "testing")]
+    pub(crate) async fn local_segments_for_test(
+        &self,
+    ) -> Option<shard::segment_holder::locked::LockedSegmentHolder> {
+        use crate::shards::shard::Shard;
+        match &*self.local.read().await {
+            Some(Shard::Local(local)) => Some(local.segments()),
+            _ => None,
         }
     }
 
@@ -612,12 +627,16 @@ impl ShardReplicaSet {
 
     /// Clears the local shard data and loads an empty local shard
     ///
+    /// Removes the shard initializing flag after the empty shard is built, before installing it. The removal happens
+    /// under the `local` lock, so it never deletes a flag created by a concurrent
+    /// [`Self::restore_local_replica_from`] for its own restore.
+    ///
     /// # Cancel safety
     ///
     /// This is cancel safe. If the future is dropped, `local` is left holding a dummy shard rather
     /// than the real thing. That dummy state is picked up like any other initialization failure: a
     /// retried call to this method clears it and tries again.
-    pub async fn init_empty_local_shard(&self) -> CollectionResult<()> {
+    pub async fn init_empty_local_shard(&self, collection_path: &Path) -> CollectionResult<()> {
         let mut local = self.local.write().await;
 
         // Keep a dummy placeholder because every await below may drop the future early on
@@ -656,6 +675,16 @@ impl ShardReplicaSet {
 
         match local_shard_res {
             Ok(local_shard) => {
+                let shard_flag = shard_initializing_flag_path(collection_path, self.shard_id);
+                match fs_err::tokio::remove_file(&shard_flag).await {
+                    Ok(()) => log::debug!("Removed shard initializing flag {shard_flag:?}"),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        local_shard.stop_gracefully().await;
+                        return Err(err.into());
+                    }
+                }
+
                 local.replace(Shard::Local(local_shard));
                 Ok(())
             }

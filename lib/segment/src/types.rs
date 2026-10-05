@@ -1873,6 +1873,7 @@ where
 #[derive(
     Debug, Deserialize, Serialize, JsonSchema, Anonymize, Eq, PartialEq, Copy, Clone, Hash,
 )]
+#[cfg_attr(any(test, feature = "testing"), derive(exhaustive::Exhaustive))]
 #[serde(rename_all = "snake_case")]
 pub enum Memory {
     // Data is not pre-loaded from disk to RAM. Preferred for rarely queried components or
@@ -2766,7 +2767,7 @@ impl Validate for PayloadSchemaParams {
             PayloadSchemaParams::Integer(integer_index_params) => integer_index_params.validate(),
             PayloadSchemaParams::Float(_) => Ok(()),
             PayloadSchemaParams::Geo(_) => Ok(()),
-            PayloadSchemaParams::Text(_) => Ok(()),
+            PayloadSchemaParams::Text(text_index_params) => text_index_params.validate(),
             PayloadSchemaParams::Bool(_) => Ok(()),
             PayloadSchemaParams::Datetime(_) => Ok(()),
             PayloadSchemaParams::Uuid(_) => Ok(()),
@@ -2869,6 +2870,20 @@ impl TryFrom<&PayloadFieldSchema> for TextIndexParams {
 }
 
 impl PayloadFieldSchema {
+    /// Apply what the params imply, see [`TextIndexParams::normalized`]. A
+    /// schema is normalized once, as the collection stores it, so every node
+    /// and every segment sees the same params.
+    pub fn normalized(self) -> Self {
+        match self {
+            PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(params)) => {
+                PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(params.normalized()))
+            }
+            schema @ (PayloadFieldSchema::FieldType(_) | PayloadFieldSchema::FieldParams(_)) => {
+                schema
+            }
+        }
+    }
+
     pub fn expand(&self) -> Cow<'_, PayloadSchemaParams> {
         match self {
             PayloadFieldSchema::FieldType(t) => Cow::Owned(t.expand()),
@@ -3137,6 +3152,26 @@ impl<S: Into<String>> From<S> for MatchPrefix {
     }
 }
 
+/// Match keyword values that contain the given string.
+///
+/// Byte-wise (hence, for valid UTF-8, character-wise) and case-sensitive,
+/// consistent with exact keyword and prefix matching. Served by a keyword
+/// index with the `prefix` option, through a scan of its key dictionary;
+/// without one, falls back to reading the payload.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub struct MatchSubstring {
+    pub substring: String,
+}
+
+impl<S: Into<String>> From<S> for MatchSubstring {
+    fn from(substring: S) -> Self {
+        MatchSubstring {
+            substring: substring.into(),
+        }
+    }
+}
+
 /// Exact match on any of the given values
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -3160,6 +3195,7 @@ pub enum MatchInterface {
     TextAny(MatchTextAny),
     Phrase(MatchPhrase),
     Prefix(MatchPrefix),
+    Substring(MatchSubstring),
     Any(MatchAny),
     Except(MatchExcept),
 }
@@ -3173,6 +3209,7 @@ pub enum Match {
     TextAny(MatchTextAny),
     Phrase(MatchPhrase),
     Prefix(MatchPrefix),
+    Substring(MatchSubstring),
     Any(MatchAny),
     Except(MatchExcept),
 }
@@ -3192,12 +3229,35 @@ impl Match {
         })
     }
 
+    pub fn new_substring(substring: &str) -> Self {
+        Self::Substring(MatchSubstring {
+            substring: substring.into(),
+        })
+    }
+
     pub fn new_any(any: AnyVariants) -> Self {
         Self::Any(MatchAny { any })
     }
 
     pub fn new_except(except: AnyVariants) -> Self {
         Self::Except(MatchExcept { except })
+    }
+
+    /// Whether values are matched by an unanchored substring.
+    ///
+    /// No key ordering bounds such a match, so answering it means looking at
+    /// every distinct value of the field, whichever index serves it.
+    pub fn is_substring(&self) -> bool {
+        match self {
+            Match::Substring(_) => true,
+            Match::Value(_)
+            | Match::Text(_)
+            | Match::TextAny(_)
+            | Match::Phrase(_)
+            | Match::Prefix(_)
+            | Match::Any(_)
+            | Match::Except(_) => false,
+        }
     }
 }
 
@@ -3221,6 +3281,9 @@ impl From<MatchInterface> for Match {
             }),
             MatchInterface::Phrase(MatchPhrase { phrase }) => Self::Phrase(MatchPhrase { phrase }),
             MatchInterface::Prefix(MatchPrefix { prefix }) => Self::Prefix(MatchPrefix { prefix }),
+            MatchInterface::Substring(MatchSubstring { substring }) => {
+                Self::Substring(MatchSubstring { substring })
+            }
         }
     }
 }
@@ -3829,6 +3892,7 @@ impl FieldCondition {
             Match::Phrase(_) => 0,
             Match::TextAny(_) => 0,
             Match::Prefix(_) => 0,
+            Match::Substring(_) => 0,
         }
     }
 }
@@ -4212,6 +4276,28 @@ impl Condition {
             Condition::Nested(nested_condition) => Some(nested_condition.array_key()),
             Condition::Filter(filter) => filter.iter_conditions().find_map(|c| c.targeted_key()),
             Condition::HasId(_)
+            | Condition::HasVector(_)
+            | Condition::Slice(_)
+            | Condition::CustomIdChecker(_) => None,
+        }
+    }
+
+    /// Key of the first [`Match::is_substring`] condition this condition
+    /// carries, nested filters included.
+    pub fn one_substring_match_key(&self) -> Option<PayloadKeyType> {
+        match self {
+            Condition::Field(field_condition) => field_condition
+                .r#match
+                .as_ref()
+                .is_some_and(Match::is_substring)
+                .then(|| field_condition.key.clone()),
+            Condition::Nested(nested_condition) => {
+                nested_condition.filter().one_substring_match_key()
+            }
+            Condition::Filter(filter) => filter.one_substring_match_key(),
+            Condition::IsEmpty(_)
+            | Condition::IsNull(_)
+            | Condition::HasId(_)
             | Condition::HasVector(_)
             | Condition::Slice(_)
             | Condition::CustomIdChecker(_) => None,
@@ -4664,6 +4750,13 @@ impl Filter {
             .map(|i| i.size_estimation())
             .max()
             .unwrap_or(0)
+    }
+
+    /// Key of the first [`Match::is_substring`] condition in this filter,
+    /// nested filters included.
+    pub fn one_substring_match_key(&self) -> Option<PayloadKeyType> {
+        self.iter_conditions()
+            .find_map(Condition::one_substring_match_key)
     }
 }
 

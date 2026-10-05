@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
+use common::low_memory::low_memory_mode;
 use common::storage_version::{StorageVersion, VERSION_FILE};
 use common::types::PointOffsetType;
 use common::universal_io::{
@@ -11,8 +13,9 @@ use common::universal_io::{
 use uuid::Uuid;
 
 use super::{ReadOnlySegment, ReadOnlyVectorData};
-use crate::common::operation_error::{OperationError, OperationResult};
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::data_types::load_profile::LoadProfile;
+use crate::id_tracker::disk_id_tracker::on_disk_format::i2e_path;
 use crate::id_tracker::read_only_tracker_enum::ReadOnlyIdTrackerEnum;
 use crate::index::UniversalReadExt;
 use crate::index::payload_config::PayloadConfig;
@@ -32,15 +35,7 @@ use crate::vector_storage::quantized::quantized_vectors::ReadOnlyQuantizedVector
 use crate::vector_storage::read_only::VectorStorageReadEnum;
 use crate::vector_storage::sparse::read_only::ReadOnlySparseVectorStorage;
 
-/// Build a per-segment [`CachedReadFs`] over `segment_path`. Schedules statically known files.
-fn build_cached_fs<Fs: UniversalReadFsAsync>(
-    fs: &Fs,
-    segment_path: &Path,
-) -> OperationResult<CachedFs<Fs>> {
-    let mut cached_fs = CachedFs::new(fs.clone(), segment_path)?;
-
-    cached_fs.cache_file_info()?;
-
+fn schedule_static_files<Fs: UniversalReadFsAsync>(cached_fs: &CachedFs<Fs>, segment_path: &Path) {
     // TODO(uio): Schedule static files in advance, after implementing
     // `read_whole_bytes_async`, so that their fetch can overlap with the listing
     // round-trip.
@@ -51,7 +46,16 @@ fn build_cached_fs<Fs: UniversalReadFsAsync>(
     ] {
         cached_fs.schedule_open(&path, None, None);
     }
+}
 
+/// Build a per-segment [`CachedReadFs`] over `segment_path`. Schedules statically known files.
+fn build_cached_fs<Fs: UniversalReadFsAsync>(
+    fs: &Fs,
+    segment_path: &Path,
+) -> OperationResult<CachedFs<Fs>> {
+    let mut cached_fs = CachedFs::new(fs.clone(), segment_path)?;
+    cached_fs.cache_file_info()?;
+    schedule_static_files(&cached_fs, segment_path);
     Ok(cached_fs)
 }
 
@@ -63,12 +67,30 @@ fn payload_populate(config: &SegmentConfig) -> Populate {
     }
 }
 
+/// Segments of up to this many points preload the id tracker data search
+/// reads, unless a placement is configured explicitly.
+const ID_TRACKER_PRELOAD_MAX_POINTS: u64 = 1024 * 1024;
+
 /// How the disk-resident id tracker's per-point data is brought into memory;
 /// the other tracker formats hold it in RAM regardless.
-fn id_tracker_populate(config: &SegmentConfig) -> Populate {
+///
+/// A cold default placement preloads what search reads (`Populate::Auto`:
+/// `i2e` and versions, not `e2i`) in segments of up to
+/// [`ID_TRACKER_PRELOAD_MAX_POINTS`], sized from the listing snapshot.
+fn id_tracker_populate(
+    config: &SegmentConfig,
+    fs: &impl CachedReadFs,
+    segment_path: &Path,
+) -> Populate {
     let memory = config.id_tracker_memory_placement().clamp_to_low_memory();
     if memory.populate_on_open() {
-        Populate::PreferBackground
+        return Populate::PreferBackground;
+    }
+    let is_small = fs
+        .cached_file_info(&i2e_path(segment_path))
+        .is_some_and(|info| info.size / size_of::<u128>() as u64 <= ID_TRACKER_PRELOAD_MAX_POINTS);
+    if config.id_tracker_memory.is_none() && !low_memory_mode().skip_populate() && is_small {
+        Populate::Auto
     } else {
         Populate::No
     }
@@ -97,6 +119,8 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
     /// does not touch, parking them cold instead of warming them (see
     /// [`LoadProfile`]). Without one, every component loads as the persisted
     /// segment config says.
+    ///
+    /// Not cancellable; see [`schedule_open`](Self::schedule_open).
     pub fn open(
         fs: &S::Fs,
         segment_path: &Path,
@@ -104,22 +128,75 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
         deferred_internal_id: Option<PointOffsetType>,
         load_profile: Option<&LoadProfile>,
     ) -> OperationResult<Self> {
-        Self::schedule_open(fs, segment_path, uuid, deferred_internal_id, load_profile)?.finish(fs)
+        Self::schedule_open(
+            fs,
+            segment_path,
+            uuid,
+            deferred_internal_id,
+            load_profile,
+            &AtomicBool::new(false),
+        )?
+        .finish(fs)
+    }
+
+    /// Take the segment's listing snapshot without blocking, for
+    /// [`schedule_open_with_cached_fs`](Self::schedule_open_with_cached_fs).
+    /// Callers opening many segments overlap their LIST round-trips.
+    pub async fn build_cached_fs_async(
+        fs: &S::Fs,
+        segment_path: &Path,
+    ) -> OperationResult<CachedFs<S::Fs>> {
+        let mut cached_fs = CachedFs::new(fs.clone(), segment_path)?;
+        cached_fs.cache_file_info_async().await?;
+        schedule_static_files(&cached_fs, segment_path);
+        Ok(cached_fs)
     }
 
     /// Stage an open without assembling the segment: take the listing snapshot
     /// and put every fetch the open needs in flight. Callers opening many
     /// segments overlap their IO ([`StagedSegmentOpen::wait`]) before
     /// assembling each one ([`StagedSegmentOpen::finish`]).
+    ///
+    /// Cancellation is cooperative: `is_stopped` is checked between the
+    /// components staged here and, carried by the returned handle, between the
+    /// components [`finish`](StagedSegmentOpen::finish) assembles. A set flag
+    /// yields [`OperationError::Cancelled`] and never a partially opened
+    /// segment. A single component's staging, the IO wait, or one component's
+    /// assembly is indivisible and can delay the observation. The flag is never
+    /// set or reset here.
     pub fn schedule_open<'a>(
         fs: &S::Fs,
         segment_path: &Path,
         uuid: Uuid,
         deferred_internal_id: Option<PointOffsetType>,
         load_profile: Option<&'a LoadProfile>,
+        is_stopped: &'a AtomicBool,
     ) -> OperationResult<StagedSegmentOpen<'a, S>> {
+        check_process_stopped(is_stopped)?;
         let fs = build_cached_fs(fs, segment_path)?;
-        let (config, payload_config) = Self::first_preopen(&fs, segment_path, load_profile)?;
+        Self::schedule_open_with_cached_fs(
+            fs,
+            segment_path,
+            uuid,
+            deferred_internal_id,
+            load_profile,
+            is_stopped,
+        )
+    }
+
+    /// [`schedule_open`](Self::schedule_open) over a snapshot already taken by
+    /// [`build_cached_fs_async`](Self::build_cached_fs_async).
+    pub fn schedule_open_with_cached_fs<'a>(
+        fs: CachedFs<S::Fs>,
+        segment_path: &Path,
+        uuid: Uuid,
+        deferred_internal_id: Option<PointOffsetType>,
+        load_profile: Option<&'a LoadProfile>,
+        is_stopped: &'a AtomicBool,
+    ) -> OperationResult<StagedSegmentOpen<'a, S>> {
+        check_process_stopped(is_stopped)?;
+        let (config, payload_config) =
+            Self::first_preopen(&fs, segment_path, load_profile, is_stopped)?;
         Ok(StagedSegmentOpen {
             fs,
             segment_path: segment_path.to_path_buf(),
@@ -128,6 +205,7 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
             config,
             payload_config,
             load_profile,
+            is_stopped,
         })
     }
 
@@ -138,24 +216,32 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
         fs: &impl CachedReadFs<File = S>,
         segment_path: &Path,
         load_profile: Option<&LoadProfile>,
+        is_stopped: &AtomicBool,
     ) -> OperationResult<(SegmentConfig, PayloadConfig)> {
         let SegmentState {
             initial_version: _,
             version: _,
             config,
         } = read_json_via(fs, segment_path.join(SEGMENT_STATE_FILE))?;
+        check_process_stopped(is_stopped)?;
 
         // Payload storage
         let payload_storage_populate = load_profile
             .and_then(|profile| profile.payload_storage_placement())
             .unwrap_or_else(|| payload_populate(&config));
         ReadOnlyPayloadStorage::preopen(fs, segment_path.to_path_buf(), payload_storage_populate)?;
+        check_process_stopped(is_stopped)?;
 
         // Id tracker; always loaded — every request resolves ids through it.
-        ReadOnlyIdTrackerEnum::preopen(fs, segment_path, id_tracker_populate(&config))?;
+        ReadOnlyIdTrackerEnum::preopen(
+            fs,
+            segment_path,
+            id_tracker_populate(&config, fs, segment_path),
+        )?;
 
         // Vector storages
         for (vector_name, vector_config) in &config.vector_data {
+            check_process_stopped(is_stopped)?;
             let path = get_vector_storage_path(segment_path, vector_name);
             let index_path = get_vector_index_path(segment_path, vector_name);
             let storage_populate =
@@ -167,12 +253,14 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
                 &index_path,
                 storage_populate,
             )?;
+            check_process_stopped(is_stopped)?;
 
             // Quantized vectors live in the vector storage directory; a no-op
             // when quantization isn't configured for this vector.
             let quantized_populate =
                 load_profile.and_then(|profile| profile.quantized_vectors_placement(vector_name));
             ReadOnlyQuantizedVectors::<S>::preopen(fs, &path, vector_config, quantized_populate)?;
+            check_process_stopped(is_stopped)?;
 
             // Vector index. A cold override defers the HNSW graph load (see
             // `LoadProfile::vector_index_placement`), so only its config is
@@ -182,12 +270,14 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
             VectorIndexReadEnum::<S>::preopen(fs, vector_config, &index_path, index_populate)?;
         }
         for (vector_name, sparse_vector_config) in &config.sparse_vector_data {
+            check_process_stopped(is_stopped)?;
             let path = get_vector_storage_path(segment_path, vector_name);
             ReadOnlySparseVectorStorage::<S>::preopen(
                 fs,
                 &path,
                 sparse_storage_populate(sparse_vector_config),
             )?;
+            check_process_stopped(is_stopped)?;
 
             // Sparse vector index; the sparse open reads lazily, so a profile
             // that never scores this vector just parks the index data cold.
@@ -203,6 +293,7 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
         }
 
         // Payload indexes
+        check_process_stopped(is_stopped)?;
         let payload_config = ReadOnlyStructPayloadIndex::preopen(
             fs,
             &get_payload_index_path(segment_path),
@@ -226,6 +317,9 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
     /// [`first_preopen`](Self::first_preopen) already parsed off `fs`, and
     /// `load_profile` is the profile that preopen already applied — the opens
     /// here must make the same placement decisions the prefetches did.
+    ///
+    /// `is_stopped` is checked between components; see
+    /// [`schedule_open`](Self::schedule_open).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_via(
         mut fs: CachedFs<S::Fs>,
@@ -236,8 +330,11 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
         uuid: Uuid,
         deferred_internal_id: Option<PointOffsetType>,
         load_profile: Option<&LoadProfile>,
+        is_stopped: &AtomicBool,
     ) -> OperationResult<Self> {
+        check_process_stopped(is_stopped)?;
         futures::executor::block_on(fs.wait_all());
+        check_process_stopped(is_stopped)?;
 
         if SegmentVersion::load_universal(&fs, segment_path)?.is_none() {
             // `FileNotFound`, not a service error: the version file is written last, so
@@ -249,7 +346,9 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
         }
 
         let is_appendable = config.is_appendable();
-        let deferred_internal_id = deferred_internal_id.filter(|_| is_appendable);
+        let deferred_internal_id = deferred_internal_id
+            .or_else(|| load_profile.and_then(|profile| profile.deferred_internal_id(&config)))
+            .filter(|_| is_appendable);
 
         let payload_storage_populate = load_profile
             .and_then(|profile| profile.payload_storage_placement())
@@ -259,6 +358,7 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
             segment_path.to_path_buf(),
             payload_storage_populate,
         )?));
+        check_process_stopped(is_stopped)?;
 
         // Detect the persisted format by attempting each format's open (no
         // per-file `exists` round-trips — important for object-storage backends).
@@ -266,7 +366,7 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
             &fs,
             segment_path,
             deferred_internal_id,
-            id_tracker_populate(&config),
+            id_tracker_populate(&config, &fs, segment_path),
         )?));
 
         // Open all vector storages up front: the payload index needs them.
@@ -275,6 +375,7 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
             Arc<AtomicRefCell<VectorStorageReadEnum<S>>>,
         > = HashMap::new();
         for (vector_name, vector_config) in &config.vector_data {
+            check_process_stopped(is_stopped)?;
             let path = get_vector_storage_path(segment_path, vector_name);
             let storage_populate =
                 load_profile.and_then(|profile| profile.vector_storage_placement(vector_name));
@@ -294,6 +395,7 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
             vector_storages.insert(vector_name.clone(), Arc::new(AtomicRefCell::new(storage)));
         }
         for (vector_name, sparse_vector_config) in &config.sparse_vector_data {
+            check_process_stopped(is_stopped)?;
             let path = get_vector_storage_path(segment_path, vector_name);
             let storage =
                 VectorStorageReadEnum::Sparse(Box::new(ReadOnlySparseVectorStorage::open(
@@ -304,6 +406,7 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
             vector_storages.insert(vector_name.clone(), Arc::new(AtomicRefCell::new(storage)));
         }
 
+        check_process_stopped(is_stopped)?;
         let payload_index = Arc::new(AtomicRefCell::new(ReadOnlyStructPayloadIndex::open(
             &fs,
             payload_storage.clone(),
@@ -316,6 +419,7 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
 
         let mut vector_data = HashMap::new();
         for (vector_name, vector_config) in &config.vector_data {
+            check_process_stopped(is_stopped)?;
             let vector_storage = vector_storages.remove(vector_name).unwrap();
             let data = ReadOnlyVectorData::open_dense(
                 &fs,
@@ -332,6 +436,7 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
             vector_data.insert(vector_name.clone(), data);
         }
         for (vector_name, sparse_vector_config) in &config.sparse_vector_data {
+            check_process_stopped(is_stopped)?;
             let vector_storage = vector_storages.remove(vector_name).unwrap();
             let data = ReadOnlyVectorData::open_sparse(
                 &fs,
@@ -352,6 +457,7 @@ impl<S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> ReadOnlySegment<S>
             SegmentType::Plain
         };
 
+        check_process_stopped(is_stopped)?;
         fs.rotate_cache_file_info();
 
         Ok(Self {
@@ -379,6 +485,7 @@ pub struct StagedSegmentOpen<'a, S: UniversalReadExt + 'static> {
     config: SegmentConfig,
     payload_config: PayloadConfig,
     load_profile: Option<&'a LoadProfile>,
+    is_stopped: &'a AtomicBool,
 }
 
 impl<'a, S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> StagedSegmentOpen<'a, S> {
@@ -390,6 +497,9 @@ impl<'a, S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> StagedSegmentO
 
     /// Assemble the segment from the staged handles. Fetches not already
     /// resolved via [`Self::wait`] are driven to completion here.
+    ///
+    /// Checks the stop flag given to [`ReadOnlySegment::schedule_open`]
+    /// between components.
     pub fn finish(self, raw_fs: &S::Fs) -> OperationResult<ReadOnlySegment<S>> {
         let Self {
             fs,
@@ -399,6 +509,7 @@ impl<'a, S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> StagedSegmentO
             config,
             payload_config,
             load_profile,
+            is_stopped,
         } = self;
         ReadOnlySegment::open_via(
             fs,
@@ -409,6 +520,7 @@ impl<'a, S: UniversalReadExt<Fs: UniversalReadFsAsync> + 'static> StagedSegmentO
             uuid,
             deferred_internal_id,
             load_profile,
+            is_stopped,
         )
     }
 }

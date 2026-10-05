@@ -1,9 +1,8 @@
-//! Scraping [`NodeContext`] out of this node's storage config
-
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use collection::config::PayloadStorageParams;
+use collection::operations::config_diff::OptimizersConfigDiff;
 use collection::shards::transfer::ShardTransferMethod;
 use common::mmap;
 use segment::data_types::collection_defaults::CollectionConfigDefaults;
@@ -21,6 +20,7 @@ fn from_storage_config() {
         max_collections: Some(7),
         wal: wal_config(),
         optimizers: optimizers_config(),
+        optimizers_overwrite: Some(optimizers_overwrite()),
         hnsw_index: hnsw_config(),
         payload: Some(payload_params()),
         on_disk_payload: true,
@@ -31,12 +31,9 @@ fn from_storage_config() {
     assert_eq!(context, expected);
 }
 
-/// Every option an operation reads is set away from its default.
-///
-/// Two pairs of read and ignored options share a type — `on_disk_payload` with
-/// `handle_collection_load_errors`, `max_collections` with `update_queue_size` — so each of the
-/// four gets a value that tells it apart from the other three.
 fn storage_config() -> StorageConfig {
+    // Give copied and ignored fields of the same type different values,
+    // so the test catches mapping the wrong field into `NodeContext`
     StorageConfig {
         collection: Some(collection_defaults()),
         shard_transfer_method: Some(ShardTransferMethod::StreamRecords),
@@ -52,7 +49,7 @@ fn storage_config() -> StorageConfig {
         snapshots_path: PathBuf::from("snapshots"),
         snapshots_config: Default::default(),
         temp_path: None,
-        optimizers_overwrite: None,
+        optimizers_overwrite: Some(optimizers_overwrite()),
         performance: PerformanceConfig {
             max_search_threads: 1,
             max_optimization_runtime_threads: 1,
@@ -102,6 +99,21 @@ fn hnsw_config() -> HnswConfig {
     HnswConfig {
         m: 32,
         ..Default::default()
+    }
+}
+
+fn optimizers_overwrite() -> OptimizersConfigDiff {
+    OptimizersConfigDiff {
+        deleted_threshold: None,
+        vacuum_min_vector_number: None,
+        default_segment_number: None,
+        max_segment_size: None,
+        #[expect(deprecated)]
+        memmap_threshold: None,
+        indexing_threshold: None,
+        flush_interval_sec: None,
+        max_optimization_threads: None,
+        prevent_unoptimized: Some(true),
     }
 }
 

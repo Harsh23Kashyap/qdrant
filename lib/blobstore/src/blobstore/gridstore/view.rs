@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use common::counter::counter_cell::CounterCell;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::generic_consts::AccessPattern;
+use common::generic_consts::{AccessPattern, Random};
 use common::universal_io::{UniversalRead, UserData};
 
 use super::pages::Pages;
@@ -19,14 +19,14 @@ use crate::tracker::{PointOffset, PointerItem, TrackerRead, ValuePointer};
 /// tracker type `T` — the writable [`Tracker`](crate::tracker::Tracker) for
 /// [`crate::Blobstore`], the [`ReadOnlyTracker`](crate::tracker::ReadOnlyTracker)
 /// for [`crate::BlobstoreReader`].
-pub(crate) struct GridstoreView<'a, V, S: UniversalRead, T: TrackerRead<S>> {
+pub(crate) struct GridstoreView<'a, V, S: UniversalRead, T: TrackerRead> {
     config: &'a GridstoreConfig,
     tracker: &'a T,
     pages: &'a Pages<S>,
     _value_type: std::marker::PhantomData<V>,
 }
 
-impl<'a, V, S: UniversalRead, T: TrackerRead<S>> GridstoreView<'a, V, S, T> {
+impl<'a, V, S: UniversalRead, T: TrackerRead> GridstoreView<'a, V, S, T> {
     pub(super) fn new(config: &'a GridstoreConfig, tracker: &'a T, pages: &'a Pages<S>) -> Self {
         Self {
             config,
@@ -45,7 +45,7 @@ impl<'a, V, S: UniversalRead, T: TrackerRead<S>> GridstoreView<'a, V, S, T> {
     }
 
     fn get_pointer(&self, point_offset: PointOffset) -> Result<Option<ValuePointer>> {
-        self.tracker.get(point_offset)
+        self.tracker.get::<Random>(point_offset)
     }
 
     /// Return the storage size in bytes (approximate: total page capacity).
@@ -62,12 +62,12 @@ impl<'a, V, S: UniversalRead, T: TrackerRead<S>> GridstoreView<'a, V, S, T> {
     }
 }
 
-impl<'a, V: Blob, S: UniversalRead, T: TrackerRead<S>> GridstoreView<'a, V, S, T> {
+impl<'a, V: Blob, S: UniversalRead, T: TrackerRead> GridstoreView<'a, V, S, T> {
     pub(super) fn compress(&self, value: Vec<u8>) -> Vec<u8> {
         self.config.compression.compress(value)
     }
 
-    pub(super) fn decompress<'val>(&self, value: Cow<'val, [u8]>) -> Cow<'val, [u8]> {
+    pub(super) fn decompress<'val>(&self, value: Cow<'val, [u8]>) -> Result<Cow<'val, [u8]>> {
         self.config.compression.decompress(value)
     }
 
@@ -78,7 +78,7 @@ impl<'a, V: Blob, S: UniversalRead, T: TrackerRead<S>> GridstoreView<'a, V, S, T
         hw_counter: &HardwareCounterCell,
     ) -> Result<Option<V>> {
         let bytes = self.get_value_bytes::<P>(point_offset, hw_counter)?;
-        Ok(bytes.map(|bytes| V::from_bytes(&bytes)))
+        bytes.map(|bytes| V::from_bytes(&bytes)).transpose()
     }
 
     /// Get the serialized value for a given point offset.
@@ -96,7 +96,7 @@ impl<'a, V: Blob, S: UniversalRead, T: TrackerRead<S>> GridstoreView<'a, V, S, T
         let raw = self.read_from_pages::<P>(pointer)?;
         hw_counter.payload_io_read_counter().incr_delta(raw.len());
 
-        Ok(Some(self.decompress(raw)))
+        Ok(Some(self.decompress(raw)?))
     }
 
     pub fn read_values<P, U, E>(
@@ -113,7 +113,8 @@ impl<'a, V: Blob, S: UniversalRead, T: TrackerRead<S>> GridstoreView<'a, V, S, T
         self.read_values_bytes::<P, _, _>(
             point_offsets,
             |user_data, point_offset, bytes| {
-                callback(user_data, point_offset, bytes.map(V::from_bytes))
+                let value = bytes.map(V::from_bytes).transpose()?;
+                callback(user_data, point_offset, value)
             },
             hw_counter_cell,
         )
@@ -157,7 +158,7 @@ impl<'a, V: Blob, S: UniversalRead, T: TrackerRead<S>> GridstoreView<'a, V, S, T
             |(user_data, point_offset), bytes| {
                 hw_counter_cell.incr_delta(bytes.len());
 
-                let decompressed = self.decompress(bytes);
+                let decompressed = self.decompress(bytes)?;
                 callback(user_data, point_offset, Some(&decompressed))
             },
         )

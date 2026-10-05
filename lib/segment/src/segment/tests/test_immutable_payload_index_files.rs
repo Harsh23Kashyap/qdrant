@@ -13,6 +13,7 @@ use std::str::FromStr as _;
 use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::flags::FeatureFlags;
 use common::types::DeferredBehavior;
 use ordered_float::OrderedFloat;
 use serde_json::json;
@@ -154,8 +155,13 @@ fn build_immutable_segment_with_indexed_payload(segments_path: &Path, temp_path:
     };
     assert!(!target_config.is_appendable());
 
-    let mut builder =
-        SegmentBuilder::new(temp_path, &target_config, &HnswGlobalConfig::default()).unwrap();
+    let mut builder = SegmentBuilder::new(
+        temp_path,
+        &target_config,
+        &HnswGlobalConfig::default(),
+        FeatureFlags::default(),
+    )
+    .unwrap();
     builder
         .update(&[&source], &AtomicBool::new(false), &hw)
         .unwrap();
@@ -447,8 +453,14 @@ fn payload_index_files_are_immutable_after_build() {
     // an index state that still answers queries correctly given the runtime
     // deletion bitvec.
     drop(segment);
-    let mut reloaded =
-        load_segment(&segment_path, segment_uuid, None, &AtomicBool::new(false)).unwrap();
+    let mut reloaded = load_segment(
+        &segment_path,
+        segment_uuid,
+        None,
+        &AtomicBool::new(false),
+        false,
+    )
+    .unwrap();
     let after_reload = snapshot_dir(&payload_index_dir);
     assert_snapshots_equal(&baseline, &after_reload, "after reload");
     assert_query_counts(&reloaded, &live, &queries, "after reload");
@@ -560,6 +572,7 @@ fn snapshot_roundtrip_recovers_block_index_sidecars(#[case] format: crate::types
         uuid::Uuid::nil(),
         None,
         &AtomicBool::new(false),
+        false,
     )
     .unwrap();
 

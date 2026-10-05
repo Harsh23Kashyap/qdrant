@@ -4,6 +4,7 @@ use std::{env, io};
 use api::grpc::transport_channel_pool::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_GRPC_TIMEOUT, DEFAULT_POOL_SIZE,
 };
+use collection::common::snapshots_manager::SnapshotsStorageConfig;
 use collection::operations::validation;
 use collection::shards::shard::PeerId;
 use common::flags::FeatureFlags;
@@ -137,6 +138,13 @@ pub struct ClusterConfig {
 
 #[derive(Debug, Deserialize, Clone, Validate)]
 pub struct P2pConfig {
+    /// Host or IP address to bind the internal (p2p) gRPC listener to.
+    /// Defaults to `service.host` when not set. Set this to an internal
+    /// interface to keep the internal port off the interface that serves
+    /// the public API.
+    #[validate(length(min = 1))]
+    #[serde(default)]
+    pub host: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
     #[serde(default = "default_connection_pool_size")]
@@ -149,6 +157,7 @@ pub struct P2pConfig {
 impl Default for P2pConfig {
     fn default() -> Self {
         P2pConfig {
+            host: None,
             port: None,
             connection_pool_size: default_connection_pool_size(),
             enable_tls: false,
@@ -172,7 +181,7 @@ pub struct ConsensusConfig {
     /// Compact WAL when it grows to enough applied entries
     #[serde(default = "default_compact_wal_entries")]
     pub compact_wal_entries: u64,
-    /// Run the consensus state machine alongside the apply path and compare the two
+    /// Compare consensus state machine with operation handlers
     #[serde(default)]
     pub shadow_state_machine: ShadowMode,
 }
@@ -413,6 +422,86 @@ impl Settings {
             }
         }
 
+        //
+        // Internal (p2p) auth in distributed mode
+        //
+        // The API key is always forwarded on internal gRPC requests, but the
+        // receiving side only verifies it when `enforce_internal_auth` is set.
+        // Warn whenever a distributed deployment leaves the internal API open,
+        // with or without an API key. Without a key, enforcement cannot be
+        // enabled at all, so the only control is network restriction of the port.
+        if self.cluster.enabled && !self.service.enforce_internal_auth.unwrap_or_default() {
+            if all_keys_are_empty {
+                log::warn!(
+                    "Running in distributed mode without an API key. The internal \
+                     (p2p) gRPC API is not authenticated, and \
+                     `service.enforce_internal_auth` cannot be enabled without \
+                     `service.api_key`. Restrict the internal port to cluster \
+                     nodes and configure an API key.",
+                );
+            } else {
+                log::warn!(
+                    "Running in distributed mode with an API key configured, but \
+                     `service.enforce_internal_auth` is not enabled. The internal \
+                     (p2p) gRPC API is not authenticated. Enable \
+                     `enforce_internal_auth`.",
+                );
+            }
+        }
+
+        // The internal API only accepts the read-write keys. With just a
+        // read-only key configured, peers have nothing to authenticate with.
+        let read_only_key_set = !self
+            .service
+            .read_only_api_key
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty();
+        if self.cluster.enabled
+            && self.service.enforce_internal_auth.unwrap_or_default()
+            && all_keys_are_empty
+            && read_only_key_set
+        {
+            log::warn!(
+                "`service.enforce_internal_auth` is enabled with only \
+                 `read_only_api_key` configured. The internal (p2p) gRPC API \
+                 accepts `api_key` or `alt_api_key` only, so peers will not be \
+                 able to reach each other. Configure `api_key`.",
+            );
+        }
+
+        //
+        // Snapshot storage
+        //
+        // A config block for a backend other than the selected one is ignored,
+        // which usually means a typo in `snapshots_storage`.
+        let snapshots_config = &self.storage.snapshots_config;
+        let selected = snapshots_config.snapshots_storage;
+        for (name, present, backend) in [
+            (
+                "s3_config",
+                snapshots_config.s3_config.is_some(),
+                SnapshotsStorageConfig::S3,
+            ),
+            (
+                "gcs_config",
+                snapshots_config.gcs_config.is_some(),
+                SnapshotsStorageConfig::Gcs,
+            ),
+            (
+                "azure_config",
+                snapshots_config.azure_config.is_some(),
+                SnapshotsStorageConfig::Azure,
+            ),
+        ] {
+            if present && selected != backend {
+                log::warn!(
+                    "Snapshots {name} is set but snapshots_storage is {selected:?}, \
+                     the block is ignored",
+                );
+            }
+        }
+
         // Print any load error messages we had
         self.load_errors.iter().for_each(LogMsg::log);
 
@@ -597,8 +686,7 @@ mod tests {
         assert!(config.load_errors.is_empty(), "must not have load errors")
     }
 
-    /// The consensus test suite turns the shadow run on through this variable, so a rename here
-    /// leaves that suite testing nothing.
+    /// Ensure environment variable used by consensus tests enables state machine validation
     #[expect(clippy::disallowed_types, reason = "#[sealed_test] uses std::fs::File")]
     #[sealed_test]
     fn shadow_state_machine_from_env() {

@@ -1,6 +1,5 @@
 use std::mem;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use ahash::AHashSet;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
@@ -27,6 +26,7 @@ use crate::read_view::{EdgeReadView, ReadSegmentHandle};
 
 impl<H: ReadSegmentHandle> EdgeReadView<H> {
     pub(crate) fn query(&self, request: ShardQueryRequest) -> OperationResult<Vec<ScoredPoint>> {
+        self.check_stopped()?;
         let [points] =
             self.query_batch(vec![request])?
                 .try_into()
@@ -53,25 +53,35 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
         &self,
         requests: Vec<ShardQueryRequest>,
     ) -> OperationResult<Vec<Vec<ScoredPoint>>> {
+        self.check_stopped()?;
+        // The planner fetches `limit + offset` points; the offset is cut off here.
+        let offsets: Vec<_> = requests.iter().map(|request| request.offset).collect();
         let planned_query = PlannedQuery::try_from(requests)?;
 
         let PlannedQuery {
             root_plans,
             searches,
             scrolls,
+            texts,
         } = planned_query;
+        if !texts.is_empty() {
+            return Err(text_not_supported());
+        }
 
         let mut search_results = self.search_batch(&searches)?;
 
         let mut scroll_results = Vec::with_capacity(scrolls.len());
         for scroll in &scrolls {
+            self.check_stopped()?;
             scroll_results.push(self.query_scroll(scroll)?);
         }
 
         let mut scored_points_batch = Vec::with_capacity(root_plans.len());
-        for root_plan in root_plans {
+        for (root_plan, offset) in root_plans.into_iter().zip(offsets) {
+            self.check_stopped()?;
             let scored_points = self.resolve_plan(
                 root_plan,
+                offset,
                 &mut search_results,
                 &mut scroll_results,
                 HwMeasurementAcc::disposable_edge(),
@@ -86,23 +96,26 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
     fn resolve_plan(
         &self,
         root_plan: RootPlan,
+        offset: usize,
         search_results: &mut Vec<Vec<ScoredPoint>>,
         scroll_results: &mut Vec<Vec<ScoredPoint>>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> OperationResult<Vec<ScoredPoint>> {
+        self.check_stopped()?;
         let RootPlan {
             merge_plan,
             with_payload,
             with_vector,
         } = root_plan;
 
-        let results = self.recurse_prefetch(
+        let mut results = self.recurse_prefetch(
             merge_plan,
             search_results,
             scroll_results,
             0,
             hw_measurement_acc.clone(),
         )?;
+        results.drain(..offset.min(results.len()));
 
         let [result] = self
             .fill_with_payload_or_vectors(
@@ -129,6 +142,7 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
         depth: usize,
         hw_counter_acc: HwMeasurementAcc,
     ) -> OperationResult<Vec<ScoredPoint>> {
+        self.check_stopped()?;
         let MergePlan {
             sources: merge_plan_sources,
             rescore_stages,
@@ -139,6 +153,7 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
 
         // We need to preserve the order of the sources for some fusion strategies
         for source in merge_plan_sources {
+            self.check_stopped()?;
             match source {
                 Source::SearchesIdx(idx) => {
                     sources.push(take_prefetched_source(search_results, idx)?)
@@ -147,6 +162,9 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
                 Source::ScrollsIdx(idx) => {
                     sources.push(take_prefetched_source(scroll_results, idx)?)
                 }
+
+                // Refused before planning resolves, see `query_batch`.
+                Source::TextsIdx(_) => return Err(text_not_supported()),
 
                 Source::Prefetch(merge_plan) => {
                     let merged = self.recurse_prefetch(
@@ -205,6 +223,7 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
         rescore_params: RescoreParams,
         hw_counter_acc: HwMeasurementAcc,
     ) -> OperationResult<Vec<ScoredPoint>> {
+        self.check_stopped()?;
         let RescoreParams {
             rescore,
             score_threshold,
@@ -285,6 +304,8 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
             },
 
             ScoringQuery::Mmr(mmr) => self.mmr_rescore(sources, mmr, limit, hw_counter_acc),
+            // Refused when the query is planned, see `MergePlan::validate`.
+            ScoringQuery::Text(_) => Err(text_not_supported()),
         }
     }
 
@@ -325,12 +346,13 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
         score_threshold: Option<ScoreType>,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> OperationResult<Vec<ScoredPoint>> {
+        self.check_stopped()?;
         let ctx = FormulaContext {
             formula,
             prefetches_results,
             limit,
             score_threshold,
-            is_stopped: Arc::new(AtomicBool::new(false)),
+            is_stopped: self.is_stopped.clone(),
         };
 
         let ctx = Arc::new(ctx);
@@ -362,6 +384,7 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
         limit: usize,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> OperationResult<Vec<ScoredPoint>> {
+        self.check_stopped()?;
         let points_with_vector = self
             .fill_with_payload_or_vectors(
                 sources,
@@ -398,13 +421,14 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
     }
 
     /// This function always filters deferred points.
-    fn fill_with_payload_or_vectors(
+    pub(super) fn fill_with_payload_or_vectors(
         &self,
         query_response: ShardQueryResponse,
         with_payload: WithPayloadInterface,
         with_vector: WithVector,
         hw_measurement_acc: HwMeasurementAcc,
     ) -> OperationResult<ShardQueryResponse> {
+        self.check_stopped()?;
         if !with_payload.is_required() && !with_vector.is_enabled() {
             return Ok(query_response);
         }
@@ -421,10 +445,11 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
             &point_ids,
             &WithPayload::from(with_payload),
             &with_vector,
-            &AtomicBool::new(false),
+            &self.is_stopped,
             hw_measurement_acc,
             DeferredBehavior::VisibleOnly,
         )?;
+        self.check_stopped()?;
 
         // It might be possible, that we won't find all records,
         // so we need to re-collect the results
@@ -446,6 +471,11 @@ impl<H: ReadSegmentHandle> EdgeReadView<H> {
 
         Ok(query_response)
     }
+}
+
+/// Edge keeps no shard-level path for BM25 over a text index yet.
+fn text_not_supported() -> OperationError {
+    OperationError::validation_error("BM25 over a text index is not supported on edge yet")
 }
 
 fn take_prefetched_source<T: Default>(items: &mut [T], index: usize) -> OperationResult<T> {
@@ -504,7 +534,9 @@ mod tests {
             .map(|request| shard.query(request.clone()).unwrap())
             .collect();
 
-        let batched = shard.query_batch(requests).unwrap();
+        let batched = shard
+            .query_batch(crate::QueryBatchRequest::new(requests))
+            .unwrap();
 
         assert_eq!(batched, one_by_one);
     }
@@ -515,7 +547,11 @@ mod tests {
         let shard = shard_with_points(&dir, 3);
 
         let batches = shard
-            .query_batch(vec![nearest(1), nearest(2), nearest(3)])
+            .query_batch(crate::QueryBatchRequest::new(vec![
+                nearest(1),
+                nearest(2),
+                nearest(3),
+            ]))
             .unwrap();
 
         assert_eq!(batches.len(), 3);
@@ -529,11 +565,32 @@ mod tests {
     }
 
     #[test]
+    fn query_skips_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = shard_with_points(&dir, 4);
+
+        let request = QueryRequestBuilder::new(1)
+            .query(nearest_query(1.0))
+            .offset(2)
+            .build();
+        let ids: Vec<_> = shard
+            .query(request)
+            .unwrap()
+            .into_iter()
+            .map(|point| point.id)
+            .collect();
+
+        assert_eq!(ids, vec![2.into()]);
+    }
+
+    #[test]
     fn query_batch_empty_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let shard = EdgeShard::new(dir.path(), test_config()).unwrap();
 
-        let batches = shard.query_batch(Vec::new()).unwrap();
+        let batches = shard
+            .query_batch(crate::QueryBatchRequest::new(Vec::new()))
+            .unwrap();
 
         assert!(batches.is_empty());
     }
@@ -665,7 +722,9 @@ mod tests {
                 .build(),
         ];
 
-        let batches = shard.query_batch(requests).unwrap();
+        let batches = shard
+            .query_batch(crate::QueryBatchRequest::new(requests))
+            .unwrap();
 
         assert!(batches[0].iter().all(|point| point.payload.is_none()));
         assert!(batches[1].iter().all(|point| point.payload.is_some()));
@@ -679,7 +738,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shard = EdgeShard::new(dir.path(), test_config()).unwrap();
 
-        let batches = shard.query_batch(vec![nearest(1), nearest(2)]).unwrap();
+        let batches = shard
+            .query_batch(crate::QueryBatchRequest::new(vec![nearest(1), nearest(2)]))
+            .unwrap();
 
         assert_eq!(batches, vec![vec![], vec![]]);
     }

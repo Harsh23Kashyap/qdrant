@@ -376,10 +376,16 @@ pub struct ShardTransferInfo {
     #[anonymize(false)]
     pub method: Option<ShardTransferMethod>,
 
-    /// A human-readable report of the transfer progress. Available only on the source peer.
+    /// A human-readable report of the transfer progress. Available only on the source peer, and
+    /// on the target peer during snapshot recovery.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[anonymize(false)]
     pub comment: Option<String>,
+
+    /// Whether the local sender task failed. Internal state for metrics only.
+    #[serde(skip)]
+    #[anonymize(false)]
+    pub failed: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema, Clone, Anonymize)]
@@ -398,7 +404,7 @@ pub struct ReshardingInfo {
 
     pub shard_key: Option<ShardKey>,
 
-    /// Only included in peer telemetry
+    /// Only included in telemetry, not collection cluster responses.
     #[serde(skip)]
     #[anonymize(false)]
     pub stage: ReshardingStage,
@@ -1387,6 +1393,7 @@ pub type CollectionResult<T> = Result<T, CollectionError>;
 #[derive(
     Default, Debug, Deserialize, Serialize, JsonSchema, Anonymize, Eq, PartialEq, Copy, Clone, Hash,
 )]
+#[cfg_attr(test, derive(exhaustive::Exhaustive))]
 #[serde(rename_all = "snake_case")]
 pub enum Datatype {
     #[default]
@@ -1959,5 +1966,47 @@ impl PeerMetadata {
     /// Whether this metadata has a different version than our current Qdrant instance.
     pub fn is_different_version(&self) -> bool {
         self.version != *defaults::QDRANT_VERSION
+    }
+
+    /// Version reported by the peer
+    pub fn version(&self) -> &Version {
+        &self.version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn test_resharding_info_serialization_omits_stage() {
+        for stage in [
+            ReshardingStage::MigratingPoints,
+            ReshardingStage::ReadHashRingCommitted,
+            ReshardingStage::WriteHashRingCommitted,
+        ] {
+            let info = ReshardingInfo {
+                uuid: Uuid::nil(),
+                direction: ReshardingDirection::Up,
+                shard_id: 1,
+                peer_id: 2,
+                shard_key: None,
+                stage,
+            };
+
+            let mut expected = json!({
+                "uuid": "00000000-0000-0000-0000-000000000000",
+                "direction": "up",
+                "shard_id": 1,
+                "peer_id": 2,
+                "shard_key": null,
+            });
+            assert_eq!(serde_json::to_value(&info).unwrap(), expected);
+
+            expected["uuid"] = json!(Uuid::nil().anonymize());
+            assert_eq!(serde_json::to_value(info.anonymize()).unwrap(), expected);
+        }
     }
 }

@@ -267,7 +267,10 @@ pub struct FieldCondition {
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Match {
-    #[prost(oneof = "r#match::MatchValue", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
+    #[prost(
+        oneof = "r#match::MatchValue",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12"
+    )]
     pub match_value: ::core::option::Option<r#match::MatchValue>,
 }
 /// Nested message and enum types in `Match`.
@@ -308,6 +311,9 @@ pub mod r#match {
         /// Match keywords starting with the given prefix
         #[prost(string, tag = "11")]
         Prefix(::prost::alloc::string::String),
+        /// Match keywords containing the given substring
+        #[prost(string, tag = "12")]
+        Substring(::prost::alloc::string::String),
     }
 }
 #[derive(serde::Serialize)]
@@ -1584,6 +1590,18 @@ pub struct TextIndexParams {
     /// Overrides the deprecated `on_disk` flag if both are set.
     #[prost(enumeration = "Memory", optional, tag = "11")]
     pub memory: ::core::option::Option<i32>,
+    /// Enable ranking points by BM25 over this field.
+    /// Implies `phrase_matching: true`. Changing it rebuilds the index.
+    /// Default: disabled.
+    #[prost(message, optional, tag = "12")]
+    pub scoring: ::core::option::Option<TextScoringParams>,
+}
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextScoringParams {
+    /// How documents are ranked
+    #[prost(enumeration = "TextScoringType", tag = "1")]
+    pub r#type: i32,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2648,6 +2666,30 @@ impl TokenizerType {
             "Whitespace" => Some(Self::Whitespace),
             "Word" => Some(Self::Word),
             "Multilingual" => Some(Self::Multilingual),
+            _ => None,
+        }
+    }
+}
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TextScoringType {
+    Bm25 = 0,
+}
+impl TextScoringType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Bm25 => "Bm25",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "Bm25" => Some(Self::Bm25),
             _ => None,
         }
     }
@@ -4132,6 +4174,9 @@ pub struct InitiateShardTransferRequest {
     /// Id of the temporary shard
     #[prost(uint32, tag = "2")]
     pub shard_id: u32,
+    /// Peer ID of the transfer source, checked against the registered shard transfer
+    #[prost(uint64, optional, tag = "3")]
+    pub from_peer_id: ::core::option::Option<u64>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -11305,6 +11350,22 @@ pub struct MmrInternal {
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TextScoringInternal {
+    /// Payload field with a text index
+    #[prost(string, tag = "1")]
+    pub field: ::prost::alloc::string::String,
+    /// Query text, tokenized on each shard by the field's tokenizer
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+    /// BM25 term frequency saturation
+    #[prost(float, tag = "3")]
+    pub k1: f32,
+    /// BM25 length normalization
+    #[prost(float, tag = "4")]
+    pub b: f32,
+}
+#[derive(serde::Serialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct QueryShardPoints {
     #[prost(message, repeated, tag = "1")]
     pub prefetch: ::prost::alloc::vec::Vec<query_shard_points::Prefetch>,
@@ -11333,7 +11394,7 @@ pub mod query_shard_points {
     #[derive(serde::Serialize)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Query {
-        #[prost(oneof = "query::Score", tags = "1, 2, 3, 4, 5, 6, 7")]
+        #[prost(oneof = "query::Score", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
         pub score: ::core::option::Option<query::Score>,
     }
     /// Nested message and enum types in `Query`.
@@ -11362,6 +11423,9 @@ pub mod query_shard_points {
             /// Parameterized RRF fusion
             #[prost(message, tag = "7")]
             Rrf(super::super::Rrf),
+            /// BM25 over the text index of a payload field
+            #[prost(message, tag = "8")]
+            Text(super::super::TextScoringInternal),
         }
     }
     #[derive(serde::Serialize)]
@@ -16023,6 +16087,9 @@ pub struct RecoverShardSnapshotRequest {
     /// Optional API key used when fetching the snapshot from a remote URL
     #[prost(string, optional, tag = "6")]
     pub api_key: ::core::option::Option<::prost::alloc::string::String>,
+    /// Peer ID of the shard transfer source, checked against the registered shard transfer
+    #[prost(uint64, optional, tag = "7")]
+    pub from_peer_id: ::core::option::Option<u64>,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

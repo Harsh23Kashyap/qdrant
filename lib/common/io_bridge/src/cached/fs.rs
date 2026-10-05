@@ -4,8 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common::universal_io::{
-    DiskCacheConfig, DiskCacheFs, DiskCacheFsContext, ListedFile, OpenOptions, UioResult,
-    UniversalReadFileOps, UniversalReadFs, UniversalWriteFileOps,
+    DiskCacheConfig, DiskCacheFs, ListedFile, OpenOptions, UioResult, UniversalReadFs,
+    UniversalWriteFs,
 };
 
 use super::CachedBlobFile;
@@ -13,6 +13,7 @@ use crate::file::BlobFile;
 use crate::fs::BlobFs;
 use crate::read::AsyncRead;
 use crate::runtime::BridgeRuntime;
+use crate::stats::RemoteIoStats;
 use crate::write::AsyncAppend;
 
 /// Construction context for [`CachedBlobFs`]: the local-mirror layout and
@@ -35,14 +36,21 @@ pub struct CachedBlobFs<A: AsyncRead + Clone> {
 }
 
 impl<A: AsyncRead + Clone> CachedBlobFs<A> {
-    /// Build both halves around one shared backend handle — unlike
-    /// [`from_context`](UniversalReadFileOps::from_context), which
-    /// constructs each half's backend from the config.
+    /// Build both halves around one shared backend handle, reporting their
+    /// remote requests into one shared observer.
     pub fn new(remote: A, runtime: BridgeRuntime, disk_cache: Arc<DiskCacheConfig>) -> Self {
+        let stats = RemoteIoStats::default();
+        let remote_fs = BlobFs::new(remote.clone(), runtime.clone()).with_stats(stats.clone());
         Self {
-            cache_fs: DiskCacheFs::new(disk_cache, BlobFs::new(remote.clone(), runtime.clone())),
-            blob_fs: BlobFs::new(remote, runtime),
+            cache_fs: DiskCacheFs::new(disk_cache, remote_fs),
+            blob_fs: BlobFs::new(remote, runtime).with_stats(stats),
         }
+    }
+
+    /// Observer of every remote request, shared by this filesystem, its
+    /// clones, and the files it opens.
+    pub fn stats(&self) -> RemoteIoStats {
+        self.blob_fs.stats()
     }
 }
 
@@ -56,22 +64,21 @@ impl<A: AsyncRead + Clone> std::fmt::Debug for CachedBlobFs<A> {
     }
 }
 
-impl<A: AsyncRead + Clone> UniversalReadFileOps for CachedBlobFs<A>
+impl<A: AsyncAppend + Clone> UniversalReadFs for CachedBlobFs<A>
 where
     A::Config: Clone,
 {
+    type File = CachedBlobFile<A>;
+    type OpenExtra = <DiskCacheFs<BlobFile<A>> as UniversalReadFs>::OpenExtra;
     type ContextConfig = CachedBlobFsContext<A::Config>;
 
     fn from_context(context: Self::ContextConfig) -> UioResult<Self> {
         let CachedBlobFsContext { disk_cache, remote } = context;
-
-        let blob_fs = BlobFs::<A>::from_context(remote.clone())?;
-        let cache_fs = DiskCacheFs::from_context(DiskCacheFsContext {
-            config: disk_cache,
-            remote,
-        })?;
-
-        Ok(Self { cache_fs, blob_fs })
+        Ok(Self::new(
+            A::open(&remote)?,
+            BridgeRuntime::global(),
+            disk_cache,
+        ))
     }
 
     fn list_files(&self, prefix_path: &Path) -> UioResult<Vec<ListedFile>> {
@@ -82,14 +89,6 @@ where
     fn exists(&self, path: &Path) -> UioResult<bool> {
         self.blob_fs.exists(path)
     }
-}
-
-impl<A: AsyncAppend + Clone> UniversalReadFs for CachedBlobFs<A>
-where
-    A::Config: Clone,
-{
-    type File = CachedBlobFile<A>;
-    type OpenExtra = <DiskCacheFs<BlobFile<A>> as UniversalReadFs>::OpenExtra;
 
     fn open(
         &self,
@@ -110,7 +109,7 @@ where
     }
 }
 
-impl<A: AsyncAppend + Clone> UniversalWriteFileOps for CachedBlobFs<A>
+impl<A: AsyncAppend + Clone> UniversalWriteFs for CachedBlobFs<A>
 where
     A::Config: Clone,
 {

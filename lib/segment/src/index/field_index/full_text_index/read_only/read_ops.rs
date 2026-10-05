@@ -1,6 +1,8 @@
+use std::sync::atomic::AtomicBool;
+
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::types::PointOffsetType;
+use common::types::{PointOffsetType, ScoredPointOffset};
 use common::universal_io::{UniversalRead, UserData};
 
 use super::super::full_text_index_read::FullTextIndexRead;
@@ -11,6 +13,7 @@ use super::ReadOnlyFullTextIndex;
 use crate::common::operation_error::OperationResult;
 use crate::index::UniversalReadExt;
 use crate::index::condition_checker::ConditionCheckerEnum;
+use crate::index::field_index::full_text_index::inverted_index::bm25::Bm25Query;
 use crate::index::field_index::{
     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndexRead,
 };
@@ -51,6 +54,64 @@ impl<S: UniversalRead> FullTextIndexRead for ReadOnlyFullTextIndex<S> {
             ReadOnlyFullTextIndex::Appendable(index) => index.values_count(point_id),
             ReadOnlyFullTextIndex::OnDisk(index) => index.values_count(point_id),
             ReadOnlyFullTextIndex::Immutable(index) => index.values_count(point_id),
+        }
+    }
+
+    fn doc_len_batch(
+        &self,
+        point_ids: &[PointOffsetType],
+        hw_counter: &HardwareCounterCell,
+        f: impl FnMut(usize, Option<u32>),
+    ) -> OperationResult<()> {
+        match self {
+            ReadOnlyFullTextIndex::Appendable(index) => {
+                index.doc_len_batch(point_ids, hw_counter, f)
+            }
+            ReadOnlyFullTextIndex::OnDisk(index) => index.doc_len_batch(point_ids, hw_counter, f),
+            ReadOnlyFullTextIndex::Immutable(index) => {
+                index.doc_len_batch(point_ids, hw_counter, f)
+            }
+        }
+    }
+
+    fn posting_len(
+        &self,
+        token_id: TokenId,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<usize>> {
+        match self {
+            ReadOnlyFullTextIndex::Appendable(index) => index.posting_len(token_id, hw_counter),
+            ReadOnlyFullTextIndex::OnDisk(index) => index.posting_len(token_id, hw_counter),
+            ReadOnlyFullTextIndex::Immutable(index) => index.posting_len(token_id, hw_counter),
+        }
+    }
+
+    fn score_bm25(
+        &self,
+        query: &Bm25Query,
+        accept: &dyn Fn(PointOffsetType) -> bool,
+        limit: usize,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Vec<ScoredPointOffset>> {
+        match self {
+            ReadOnlyFullTextIndex::Appendable(index) => {
+                index.score_bm25(query, accept, limit, is_stopped, hw_counter)
+            }
+            ReadOnlyFullTextIndex::OnDisk(index) => {
+                index.score_bm25(query, accept, limit, is_stopped, hw_counter)
+            }
+            ReadOnlyFullTextIndex::Immutable(index) => {
+                index.score_bm25(query, accept, limit, is_stopped, hw_counter)
+            }
+        }
+    }
+
+    fn total_tokens(&self) -> Option<u64> {
+        match self {
+            ReadOnlyFullTextIndex::Appendable(index) => index.total_tokens(),
+            ReadOnlyFullTextIndex::OnDisk(index) => index.total_tokens(),
+            ReadOnlyFullTextIndex::Immutable(index) => index.total_tokens(),
         }
     }
 

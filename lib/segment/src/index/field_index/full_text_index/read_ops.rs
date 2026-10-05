@@ -1,9 +1,11 @@
+use std::sync::atomic::AtomicBool;
+
 use common::condition_checker::{
     CheckItem, ConditionChecker, ConstantConditionChecker, Partitioner, Rest, Select,
 };
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::types::PointOffsetType;
+use common::types::{PointOffsetType, ScoredPointOffset};
 use common::universal_io::UserData;
 use serde_json::Value;
 
@@ -13,13 +15,14 @@ use super::inverted_index::{ParsedQuery, TokenId};
 use super::tokenizers::Tokenizer;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::index::condition_checker::ConditionCheckerEnum;
+use crate::index::field_index::full_text_index::inverted_index::bm25::Bm25Query;
 use crate::index::field_index::{
     CardinalityEstimation, PayloadBlockCondition, PayloadFieldIndexRead,
 };
 use crate::index::payload_config::StorageType;
 use crate::types::{
-    FieldCondition, Match, MatchAny, MatchExcept, MatchPhrase, MatchPrefix, MatchText,
-    MatchTextAny, MatchValue, PayloadKeyType,
+    FieldCondition, Match, MatchAny, MatchExcept, MatchPhrase, MatchPrefix, MatchSubstring,
+    MatchText, MatchTextAny, MatchValue, PayloadKeyType,
 };
 
 impl FullTextIndexRead for FullTextIndex {
@@ -52,6 +55,56 @@ impl FullTextIndexRead for FullTextIndex {
             Self::Mutable(index) => index.values_count(point_id),
             Self::Immutable(index) => index.values_count(point_id),
             Self::OnDisk(index) => index.values_count(point_id),
+        }
+    }
+
+    fn doc_len_batch(
+        &self,
+        point_ids: &[PointOffsetType],
+        hw_counter: &HardwareCounterCell,
+        f: impl FnMut(usize, Option<u32>),
+    ) -> OperationResult<()> {
+        match self {
+            Self::Mutable(index) => index.doc_len_batch(point_ids, hw_counter, f),
+            Self::Immutable(index) => index.doc_len_batch(point_ids, hw_counter, f),
+            Self::OnDisk(index) => index.doc_len_batch(point_ids, hw_counter, f),
+        }
+    }
+
+    fn posting_len(
+        &self,
+        token_id: TokenId,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<usize>> {
+        match self {
+            Self::Mutable(index) => index.posting_len(token_id, hw_counter),
+            Self::Immutable(index) => index.posting_len(token_id, hw_counter),
+            Self::OnDisk(index) => index.posting_len(token_id, hw_counter),
+        }
+    }
+
+    fn score_bm25(
+        &self,
+        query: &Bm25Query,
+        accept: &dyn Fn(PointOffsetType) -> bool,
+        limit: usize,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Vec<ScoredPointOffset>> {
+        match self {
+            Self::Mutable(index) => index.score_bm25(query, accept, limit, is_stopped, hw_counter),
+            Self::Immutable(index) => {
+                index.score_bm25(query, accept, limit, is_stopped, hw_counter)
+            }
+            Self::OnDisk(index) => index.score_bm25(query, accept, limit, is_stopped, hw_counter),
+        }
+    }
+
+    fn total_tokens(&self) -> Option<u64> {
+        match self {
+            Self::Mutable(index) => index.total_tokens(),
+            Self::Immutable(index) => index.total_tokens(),
+            Self::OnDisk(index) => index.total_tokens(),
         }
     }
 
@@ -246,7 +299,11 @@ pub fn filter<'a, T: FullTextIndexRead>(
         Match::TextAny(MatchTextAny { text_any }) => {
             index.parse_text_any_query(text_any, hw_counter)
         }
-        Match::Value(_) | Match::Any(_) | Match::Except(_) | Match::Prefix(_) => {
+        Match::Value(_)
+        | Match::Any(_)
+        | Match::Except(_)
+        | Match::Prefix(_)
+        | Match::Substring(_) => {
             return Ok(None);
         }
     }?;
@@ -274,7 +331,11 @@ pub fn estimate_cardinality<T: FullTextIndexRead>(
         Match::TextAny(MatchTextAny { text_any }) => {
             index.parse_text_any_query(text_any, hw_counter)
         }
-        Match::Value(_) | Match::Any(_) | Match::Except(_) | Match::Prefix(_) => {
+        Match::Value(_)
+        | Match::Any(_)
+        | Match::Except(_)
+        | Match::Prefix(_)
+        | Match::Substring(_) => {
             return Ok(None);
         }
     }?;
@@ -336,7 +397,8 @@ pub fn condition_checker<'a, T: FullTextIndexRead>(
         Match::Value(MatchValue { value: _ })
         | Match::Any(MatchAny { any: _ })
         | Match::Except(MatchExcept { except: _ })
-        | Match::Prefix(MatchPrefix { prefix: _ }) => return Ok(None),
+        | Match::Prefix(MatchPrefix { prefix: _ })
+        | Match::Substring(MatchSubstring { substring: _ }) => return Ok(None),
     };
 
     let query_opt = match query_type {
@@ -411,6 +473,13 @@ pub fn special_check_condition<T: FullTextIndexRead>(
             PayloadMatchQueryType::TextAny,
             hw_counter,
         )?),
-        Some(Match::Value(_) | Match::Any(_) | Match::Except(_) | Match::Prefix(_)) | None => None,
+        Some(
+            Match::Value(_)
+            | Match::Any(_)
+            | Match::Except(_)
+            | Match::Prefix(_)
+            | Match::Substring(_),
+        )
+        | None => None,
     })
 }

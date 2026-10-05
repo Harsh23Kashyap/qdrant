@@ -1,3 +1,4 @@
+mod action_applier;
 mod collection_container;
 mod collection_meta_ops;
 mod create_collection;
@@ -110,11 +111,7 @@ pub struct TableOfContent {
     telemetry: TocTelemetryCollector,
     /// Cluster-wide resource quotas, applied to updates on top of strict mode.
     quota_manager: Arc<QuotaManager>,
-    /// Collections whose state changed without a consensus operation asking for it.
-    ///
-    /// Recovering a partial shard snapshot rewrites the payload index schema, which is part of
-    /// the state consensus decides on. The shadow run reads these collections back rather than
-    /// reporting the change as a divergence.
+    /// Collections changed outside consensus since the last shadow resync
     dirty_collections: parking_lot::Mutex<BTreeSet<CollectionId>>,
 }
 
@@ -308,7 +305,7 @@ impl TableOfContent {
         })
     }
 
-    /// Record that `collection` changed without a consensus operation asking for it
+    /// Mark a collection for shadow-state resync
     pub fn mark_collection_dirty(&self, collection: &str) {
         self.dirty_collections.lock().insert(collection.to_string());
     }
@@ -619,13 +616,14 @@ impl TableOfContent {
         &self,
         collection_name: String,
         shard_id: ShardId,
+        from_peer_id: Option<PeerId>,
     ) -> Result<(), StorageError> {
         log::info!("Initiating receiving shard {collection_name}:{shard_id}");
 
         let initiate_shard_transfer_future = self
             .get_collection_unchecked(&collection_name)
             .await?
-            .initiate_shard_transfer(shard_id);
+            .initiate_shard_transfer(shard_id, from_peer_id);
         initiate_shard_transfer_future.await?;
         Ok(())
     }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use common::flags::{FeatureFlags, init_feature_flags};
 use rand::RngExt;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, VectorInternal};
 use segment::json_path::JsonPath;
@@ -1937,20 +1938,27 @@ fn test_double_proxies() {
     assert!(has_point, "Point should be present in double proxy");
 
     // Unproxy once
+    let outer_proxy_ids: Vec<_> = outer_proxies.iter().map(|(id, _)| *id).collect();
     SegmentHolder::unproxy_all_segments(
+        &holder,
         outer_segments_lock,
-        outer_proxies,
+        &outer_proxy_ids,
         outer_tmp_segment,
-        holder.acquire_updates_lock(),
     )
     .unwrap();
 
+    // Release the outer proxies before unproxying the inner ones. One of them wraps the inner
+    // temporary segment, which the unproxy below removes: it can only drop its data once this
+    // holds no reference to it anymore, and blocks for `DROP_DATA_TIMEOUT` if it does.
+    drop(outer_proxies);
+
     // Unproxy twice
+    let inner_proxy_ids: Vec<_> = inner_proxies.iter().map(|(id, _)| *id).collect();
     SegmentHolder::unproxy_all_segments(
+        &holder,
         holder.upgradable_read(),
-        inner_proxies,
+        &inner_proxy_ids,
         inner_tmp_segment,
-        holder.acquire_updates_lock(),
     )
     .unwrap();
 
@@ -2542,5 +2550,518 @@ fn test_flush_up_to_keeps_cow_dependency_past_the_bound() {
             .count(),
         0,
         "the dependency is persisted, it must be retired",
+    );
+}
+
+/// A proxy segment must not hold back acknowledging the WAL. Flushing persists its buffered
+/// changes into the pending changes log, so the version returned by `flush_all` — which is what
+/// gets acknowledged in the WAL — advances past operations that only live in the proxy.
+#[test]
+fn test_proxy_segment_does_not_hold_back_wal_ack() {
+    use crate::proxy_segment::ProxySegment;
+
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut holder = SegmentHolder::default();
+
+    // Wrap a segment at version 6 in a proxy, as the optimizer and snapshots do
+    let wrapped_segment = LockedSegment::new(build_segment_1(dir.path()));
+    let proxy_segment = ProxySegment::new(wrapped_segment.clone());
+    let proxy_id = holder.add_new_locked(LockedSegment::from(proxy_segment));
+
+    // All segment state is persisted after a flush, the full version can be acknowledged
+    let version = holder.flush_all(FlushMode::Sync, false).unwrap();
+    assert_eq!(version, 6);
+
+    // Buffer a point delete in the proxy; it is in memory only, so it caps the acknowledgeable
+    // version until it is persisted
+    holder
+        .get(proxy_id)
+        .unwrap()
+        .get()
+        .write()
+        .delete_point(100, 2.into(), &hw_counter)
+        .unwrap();
+
+    // Flushing persists the buffered delete into the pending changes log of the wrapped
+    // segment, so the WAL can be acknowledged up to and including the delete operation even
+    // though the wrapped segment itself never saw it
+    let version = holder.flush_all(FlushMode::Sync, false).unwrap();
+    assert_eq!(
+        version, 100,
+        "flushed proxy segment must not hold back the WAL acknowledge",
+    );
+
+    // The wrapped segment on disk is still at its own version; the difference is covered by the
+    // pending changes log
+    assert_eq!(wrapped_segment.get().read().version(), 6);
+}
+
+/// Unwrapping a proxy puts the wrapped segment back into the holder, so everything the proxy
+/// buffered must be propagated into it first — otherwise the changes are only visible again
+/// after a restart replays the pending changes log.
+#[test]
+fn test_unwrap_proxy_propagates_pending_changes() {
+    use crate::optimize::unwrap_proxy;
+    use crate::proxy_segment::ProxySegment;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut holder = SegmentHolder::default();
+    let wrapped_segment = LockedSegment::new(build_segment_1(dir.path()));
+    let proxy_segment = ProxySegment::new(wrapped_segment.clone());
+    let proxy_id = holder.add_new_locked(LockedSegment::from(proxy_segment));
+    let holder = LockedSegmentHolder::new(holder);
+
+    {
+        let segments = holder.read();
+        segments
+            .get(proxy_id)
+            .unwrap()
+            .get()
+            .write()
+            .delete_point(100, 2.into(), &hw_counter)
+            .unwrap();
+    }
+    assert!(
+        wrapped_segment
+            .get()
+            .read()
+            .has_point(2.into(), DeferredBehavior::VisibleOnly)
+    );
+
+    unwrap_proxy(&holder, &[proxy_id]).unwrap();
+
+    let segments = holder.read();
+    assert!(matches!(
+        segments.get(proxy_id).unwrap(),
+        LockedSegment::Original(_),
+    ));
+    assert!(
+        !wrapped_segment
+            .get()
+            .read()
+            .has_point(2.into(), DeferredBehavior::VisibleOnly),
+        "unwrapping must propagate the buffered delete into the wrapped segment",
+    );
+}
+
+/// Unwrapping a proxy whose buffered changes cannot be propagated must not report success: the
+/// WAL acknowledge already passed those operations, so the caller has to know they are only
+/// recoverable from the pending changes log on the next restart.
+#[test]
+fn test_unwrap_proxy_reports_failed_propagation() {
+    use segment::data_types::vector_name_config::{DenseVectorConfig, VectorNameConfig};
+    use segment::segment_constructor::get_vector_storage_path;
+
+    use crate::optimize::unwrap_proxy;
+    use crate::proxy_segment::ProxySegment;
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+
+    let wrapped_segment = LockedSegment::new(build_segment_1(dir.path()));
+    let wrapped_segment_dir = wrapped_segment.get().read().data_path();
+
+    let mut proxy_segment = ProxySegment::new(wrapped_segment.clone());
+    proxy_segment
+        .create_vector_name(
+            100,
+            "v2",
+            &VectorNameConfig::dense(DenseVectorConfig {
+                size: 8,
+                distance: Distance::Dot,
+                multivector_config: None,
+                datatype: None,
+            }),
+        )
+        .unwrap();
+    proxy_segment.flush(false).unwrap();
+
+    // A plain file where the new vector's storage directory has to go, so propagating the
+    // buffered create into the wrapped segment fails
+    fs_err::write(
+        get_vector_storage_path(&wrapped_segment_dir, "v2"),
+        b"not a directory",
+    )
+    .unwrap();
+
+    let mut holder = SegmentHolder::default();
+    let proxy_id = holder.add_new_locked(LockedSegment::from(proxy_segment));
+    let holder = LockedSegmentHolder::new(holder);
+
+    let result = unwrap_proxy(&holder, &[proxy_id]);
+
+    assert!(
+        !wrapped_segment
+            .get()
+            .read()
+            .vector_names()
+            .iter()
+            .any(|name| name == "v2"),
+        "test setup must make the propagation fail",
+    );
+    assert!(
+        result.is_err(),
+        "unwrap_proxy must not report success when propagation failed",
+    );
+}
+
+/// Like `test_flush_all_does_not_claim_an_unfinished_operation`, but the segment holding the first
+/// phase of the operation is a proxy: its pending changes log must not claim the unfinished
+/// operation either, or the WAL acknowledge moves past an operation another segment still holds
+/// half of.
+#[test]
+fn test_flush_all_up_to_does_not_claim_unfinished_operation_through_proxy() {
+    use crate::proxy_segment::ProxySegment;
+
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let wrapped_segment = LockedSegment::new(build_segment_1(dir.path()));
+    let proxy_segment = ProxySegment::new(wrapped_segment.clone());
+
+    let mut holder = SegmentHolder::default();
+    let proxy_id = holder.add_new_locked(LockedSegment::from(proxy_segment));
+
+    holder
+        .get(proxy_id)
+        .unwrap()
+        .get()
+        .write()
+        .delete_point(10, 1.into(), &hw_counter)
+        .unwrap();
+
+    let acknowledged = holder
+        .flush_all_up_to(FlushMode::Sync, false, Some(9))
+        .unwrap();
+    assert!(
+        acknowledged <= 9,
+        "acknowledged version {acknowledged} must leave the unfinished operation 10 replayable",
+    );
+
+    assert_eq!(holder.flush_all(FlushMode::Sync, false).unwrap(), 10);
+}
+
+/// What `proxy_all_segments_and_apply` does for a shard snapshot, with `operation` run on every
+/// proxied segment's wrapped segment while the holder is still proxied.
+fn snapshot_all_segments_with(
+    holder: &LockedSegmentHolder,
+    segments_dir: &Path,
+    schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+    mut operation: impl FnMut(&SegmentHolder, &RwLock<dyn SegmentEntry>) -> OperationResult<()>,
+) -> OperationResult<()> {
+    let segments_lock = holder.upgradable_read();
+    let (proxies, tmp_segment_id, segments_lock) =
+        SegmentHolder::proxy_all_segments(segments_lock, segments_dir, None, schema, None)?;
+    segments_lock.flush_all_up_to(FlushMode::Sync, true, None)?;
+    for (_, proxy) in &proxies {
+        let LockedSegment::Proxy(proxy) = proxy else {
+            continue;
+        };
+        let wrapped = proxy.read().wrapped_segment.clone();
+        operation(&segments_lock, wrapped.get())?;
+    }
+    let proxy_ids: Vec<_> = proxies.iter().map(|(segment_id, _)| *segment_id).collect();
+    SegmentHolder::unproxy_all_segments(holder, segments_lock, &proxy_ids, tmp_segment_id)
+}
+
+fn delete_through_proxies(
+    segments: &SegmentHolder,
+    op_num: SeqNumberType,
+    point_id: PointIdType,
+    hw_counter: &HardwareCounterCell,
+) -> OperationResult<()> {
+    for (_, segment) in segments.iter() {
+        if let LockedSegment::Proxy(proxy) = segment {
+            proxy.write().delete_point(op_num, point_id, hw_counter)?;
+        }
+    }
+    Ok(())
+}
+
+/// Snapshotting proxies every segment, and a proxy persists the changes buffered meanwhile into
+/// its pending changes log. That log must not be visible from the wrapped segment, otherwise it is
+/// packed and restoring replays e.g. CoW deletes whose upserts only live in the temp segment.
+/// Once unproxied and flushed, that log must be removed, as `unwrap_proxy` does for optimizer
+/// proxies; otherwise every snapshot leaves a log behind until the next restart. Until then it is
+/// not listed either: a snapshot gets its changes from the wrapped segment, which it flushes first.
+#[test]
+fn test_snapshot_proxies_clean_up_pending_changes_logs() {
+    use common::tar_ext;
+    use common::tar_unpack::tar_unpack_file;
+    use segment::pending_changes::{
+        PersistedProxyChanges, list_pending_changes_log_files, recover_pending_changes,
+    };
+    use segment::segment_constructor::load_segment;
+    use segment::types::SnapshotFormat;
+
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let segment = build_segment_1(dir.path());
+    let segment_path = segment.segment_path.clone();
+    let segment_uuid = segment.segment_uuid();
+    let mut holder = SegmentHolder::default();
+    holder.add_new(segment);
+    let holder = LockedSegmentHolder::new(holder);
+    let segments_dir = Builder::new().prefix("segments_dir").tempdir().unwrap();
+    let schema =
+        Arc::new(SaveOnDisk::load_or_init_default(dir.path().join("payload.schema")).unwrap());
+
+    snapshot_all_segments_with(
+        &holder,
+        segments_dir.path(),
+        schema.clone(),
+        |segments, wrapped| {
+            delete_through_proxies(segments, 100, 1.into(), &hw_counter)?;
+            segments.flush_all(FlushMode::Sync, true)?;
+            assert_eq!(list_pending_changes_log_files(&segment_path).len(), 1);
+            assert!(
+                wrapped
+                    .read()
+                    .visible_pending_changes_log_files()
+                    .is_empty()
+            );
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(list_pending_changes_log_files(&segment_path).len(), 1);
+    let segment = holder.read().iter().next().unwrap().1.clone();
+    assert!(
+        segment
+            .get()
+            .read()
+            .visible_pending_changes_log_files()
+            .is_empty()
+    );
+
+    // Snapshot again while the log awaits removal, the delete it holds must survive a restore
+    let snapshot_file = Builder::new().suffix(".snapshot.tar").tempfile().unwrap();
+    let tar = tar_ext::BuilderExt::new_seekable_owned(
+        fs_err::File::create(snapshot_file.path()).unwrap(),
+    );
+    let temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
+    snapshot_all_segments_with(&holder, segments_dir.path(), schema, |_, wrapped| {
+        wrapped
+            .read()
+            .take_snapshot(temp_dir.path(), &tar, SnapshotFormat::Streamable, None)
+    })
+    .unwrap();
+    tar.blocking_finish().unwrap();
+
+    let unpacked = Builder::new().prefix("unpacked").tempdir().unwrap();
+    tar_unpack_file(snapshot_file.path(), unpacked.path()).unwrap();
+    let restored_path = unpacked.path().join(segment_uuid.to_string());
+    Segment::restore_snapshot_in_place(&restored_path).unwrap();
+    let mut restored = load_segment(
+        &restored_path,
+        uuid::Uuid::nil(),
+        None,
+        &AtomicBool::new(false),
+        false,
+    )
+    .unwrap();
+    recover_pending_changes(&mut restored, PersistedProxyChanges::Replay).unwrap();
+    assert!(!restored.has_point(1.into(), DeferredBehavior::VisibleOnly));
+    assert!(restored.has_point(2.into(), DeferredBehavior::VisibleOnly));
+
+    holder.read().flush_all(FlushMode::Sync, true).unwrap();
+    assert!(
+        list_pending_changes_log_files(&segment_path).is_empty(),
+        "pending changes logs of snapshot proxies must be removed once the wrapped segment flushed",
+    );
+}
+
+/// With nested proxies, a proxy lists its own log and the logs of the layers below it, never the
+/// logs of the layers wrapping it.
+#[test]
+fn test_nested_proxies_pending_changes_logs() {
+    use segment::entry::SnapshotEntry as _;
+
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_counter = HardwareCounterCell::new();
+    let segment = build_segment_1(dir.path());
+    let mut holder = SegmentHolder::default();
+    let segment_id = holder.add_new(segment);
+    let holder = LockedSegmentHolder::new(holder);
+    let segments_dir = Builder::new().prefix("segments_dir").tempdir().unwrap();
+    let schema =
+        Arc::new(SaveOnDisk::load_or_init_default(dir.path().join("payload.schema")).unwrap());
+
+    let proxy_at = |segments: &SegmentHolder| match segments.get(segment_id) {
+        Some(LockedSegment::Proxy(proxy)) => proxy.clone(),
+        _ => panic!("segment {segment_id} must be proxied"),
+    };
+
+    // Inner proxy layer, persisting a delete into its log
+    let (_, _, segments_lock) = SegmentHolder::proxy_all_segments(
+        holder.upgradable_read(),
+        segments_dir.path(),
+        None,
+        schema.clone(),
+        None,
+    )
+    .unwrap();
+    delete_through_proxies(&segments_lock, 100, 1.into(), &hw_counter).unwrap();
+    segments_lock.flush_all(FlushMode::Sync, true).unwrap();
+    let inner = proxy_at(&segments_lock);
+    let inner_log = inner.read().pending_changes_log_path().to_path_buf();
+
+    // Outer proxy layer wrapping the inner one, persisting another delete into its own log
+    let (_, _, segments_lock) =
+        SegmentHolder::proxy_all_segments(segments_lock, segments_dir.path(), None, schema, None)
+            .unwrap();
+    delete_through_proxies(&segments_lock, 101, 2.into(), &hw_counter).unwrap();
+    segments_lock.flush_all(FlushMode::Sync, true).unwrap();
+    let outer = proxy_at(&segments_lock);
+    let outer_log = outer.read().pending_changes_log_path().to_path_buf();
+    assert_ne!(inner_log, outer_log);
+    assert!(inner_log.is_file() && outer_log.is_file());
+
+    // Each layer lists its own log and the ones below, not the ones above
+    assert_eq!(
+        inner.read().visible_pending_changes_log_files(),
+        vec![inner_log.clone()],
+    );
+    assert_eq!(
+        outer.read().visible_pending_changes_log_files(),
+        vec![inner_log.clone(), outer_log.clone()],
+    );
+}
+
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    pub(crate) static BETWEEN_UNPROXY_PHASES_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test hook run by `SegmentHolder::unproxy_segments` between its two propagation phases, on the
+/// calling thread only. Stands in for an update landing while phase 1 runs without the updates
+/// lock.
+pub(crate) fn between_unproxy_phases_hook() {
+    BETWEEN_UNPROXY_PHASES_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+/// Phase 1 of `unproxy_segments` runs without the updates lock, so changes keep landing on the
+/// proxy and phase 2 has a delta of its own. That delta is held by the proxy alone: it never
+/// reached the pending changes log, and the other segments make the operation durable, so the WAL
+/// is acknowledged past it. Phase 2 must therefore fail closed like phase 1, see
+/// `test_unwrap_proxy_reports_failed_propagation`, or the change is recoverable from nowhere.
+#[test]
+fn unproxy_phase_two_propagation_failure_keeps_change_recoverable() {
+    use segment::data_types::vector_name_config::{DenseVectorConfig, VectorNameConfig};
+    use segment::pending_changes::list_pending_changes_log_files;
+    use segment::segment_constructor::get_vector_storage_path;
+
+    use crate::optimize::unwrap_proxy;
+    use crate::proxy_segment::ProxySegment;
+
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let vector_config = VectorNameConfig::dense(DenseVectorConfig {
+        size: 4,
+        distance: Distance::Dot,
+        multivector_config: None,
+        datatype: None,
+    });
+
+    let wrapped = LockedSegment::new(build_segment_1(dir.path()));
+    let wrapped_dir = wrapped.get().read().data_path();
+    let other = LockedSegment::new(build_segment_2(dir.path()));
+
+    let mut holder = SegmentHolder::default();
+    let proxy_id = holder.add_new_locked(LockedSegment::from(ProxySegment::new(wrapped.clone())));
+    let _other_id = holder.add_new_locked(other.clone());
+    let holder = LockedSegmentHolder::new(holder);
+
+    let LockedSegment::Proxy(proxy) = holder.read().get(proxy_id).unwrap().clone() else {
+        panic!("segment must be a proxy");
+    };
+
+    // Operation 100 creates a new named vector on every segment. It lands while phase 1 already
+    // ran, so only phase 2 sees it for the proxied segment — where it is made to fail.
+    let hook_config = vector_config.clone();
+    BETWEEN_UNPROXY_PHASES_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs_err::write(
+                get_vector_storage_path(&wrapped_dir, "v2"),
+                b"not a directory",
+            )
+            .unwrap();
+            proxy
+                .write()
+                .create_vector_name(100, "v2", &hook_config)
+                .unwrap();
+        }));
+    });
+
+    other
+        .get()
+        .write()
+        .create_vector_name(100, "v2", &vector_config)
+        .unwrap();
+
+    let result = unwrap_proxy(&holder, &[proxy_id]);
+    BETWEEN_UNPROXY_PHASES_HOOK.with(|hook| *hook.borrow_mut() = None);
+
+    assert!(
+        result.is_err(),
+        "a phase 2 propagation failure must be reported, like the same failure in phase 1",
+    );
+
+    let has_vector = wrapped
+        .get()
+        .read()
+        .vector_names()
+        .iter()
+        .any(|name| name == "v2");
+    assert!(
+        !has_vector,
+        "test setup must make the phase 2 propagation fail",
+    );
+
+    assert!(
+        matches!(holder.read().get(proxy_id), Some(LockedSegment::Proxy(_))),
+        "the proxy must stay installed, it is the only thing still holding the change",
+    );
+
+    // The other segment makes operation 100 durable, so a flush acknowledges the WAL past it. That
+    // is safe only because the proxy is still here: flushing persists the change it kept into its
+    // pending changes log, from where a restart replays it.
+    let acknowledged = holder.read().flush_all(FlushMode::Sync, false).unwrap();
+    assert!(
+        !list_pending_changes_log_files(&wrapped.get().read().data_path()).is_empty(),
+        "WAL acknowledged {acknowledged}, so operation 100 must be persisted in the pending \
+         changes log",
     );
 }

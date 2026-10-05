@@ -2,7 +2,7 @@ use std::fmt;
 
 use bytemuck::{TransparentWrapper, TransparentWrapperAlloc as _};
 use derive_more::Into;
-use edge::{Prefetch, QueryRequest};
+use edge::{Prefetch, QueryBatchRequest, QueryRequest};
 use ordered_float::OrderedFloat;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyValueError;
@@ -16,6 +16,31 @@ use shard::query::*;
 
 use super::*;
 use crate::repr::*;
+
+/// Queries executed together as one planned batch.
+#[pyclass(name = "QueryBatchRequest", from_py_object)]
+#[derive(Clone, Debug, Into)]
+pub struct PyQueryBatchRequest(QueryBatchRequest);
+
+#[pyclass_repr]
+#[pymethods]
+impl PyQueryBatchRequest {
+    #[new]
+    pub fn new(queries: Vec<PyQueryRequest>) -> Self {
+        Self(QueryBatchRequest::new(
+            queries.into_iter().map(Into::into).collect(),
+        ))
+    }
+
+    #[getter]
+    pub fn queries(&self) -> Vec<PyQueryRequest> {
+        self.0.queries.iter().cloned().map(PyQueryRequest).collect()
+    }
+
+    pub fn __repr__(&self) -> String {
+        self.repr()
+    }
+}
 
 #[pyclass(name = "QueryRequest", from_py_object)]
 #[derive(Clone, Debug, Into)]
@@ -250,6 +275,8 @@ impl FromPyObject<'_, '_> for PyScoringQuery {
                 ScoringQuery::Formula(_) => {}
                 ScoringQuery::Sample(_) => {}
                 ScoringQuery::Mmr(_) => {}
+                // Not exposed: edge does not run BM25 over a text index yet.
+                ScoringQuery::Text(_) => {}
             }
         }
 
@@ -279,6 +306,10 @@ impl<'py> IntoPyObject<'py> for PyScoringQuery {
             ScoringQuery::Formula(formula) => PyFormula(formula).into_bound_py_any(py),
             ScoringQuery::Sample(sample) => PySample::from(sample).into_bound_py_any(py),
             ScoringQuery::Mmr(mmr) => PyMmr(mmr).into_bound_py_any(py),
+            // Never built from Python, see `_variants`.
+            ScoringQuery::Text(_) => Err(PyValueError::new_err(
+                "BM25 over a text index is not supported on edge yet",
+            )),
         }
     }
 }
@@ -302,6 +333,7 @@ impl Repr for PyScoringQuery {
             ScoringQuery::Formula(_formula) => f.unimplemented(), // TODO!
             ScoringQuery::Sample(sample) => PySample::from(*sample).fmt(f),
             ScoringQuery::Mmr(mmr) => PyMmr::wrap_ref(mmr).fmt(f),
+            ScoringQuery::Text(_) => f.unimplemented(),
         }
     }
 }

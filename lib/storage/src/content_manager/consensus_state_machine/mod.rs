@@ -1,25 +1,22 @@
 //! In-memory consensus state machine.
 //!
-//! [`ClusterState`] holds everything consensus decides on. [`ConsensusStateMachine::apply`] reads
-//! it and returns the [`Action`]s an operation applies, in order. Each action is one call to a
-//! state change method on `TableOfContent`, `Collection` or `ShardHolder`, which checks only that
-//! the object it touches exists and then persists the change. Every decision is made here.
+//! [`ConsensusStateMachine::apply`] evaluates an operation against [`ClusterState`].
+//! For accepted operations, it returns ordered [`Action`]s to be applied to `TableOfContent`
+//! and applies the same actions to in-memory state; rejected operations leave state unchanged.
 //!
-//! [`ClusterState::apply_action`] is the only way an operation changes the state, and it cannot
-//! fail. So a rejected operation leaves the state untouched, and applying the first N actions of
-//! an operation gives the state that a crash after N writes leaves behind.
+//! [`ClusterState::apply_action`] cannot fail.
+//! Applying the first N actions reproduces state left by a crash after N writes.
 //!
-//! Two rules every operation follows:
+//! Operations follow two replay-safety rules:
 //!
-//! 1. Never reject a partially applied operation: rejecting one makes the partial state permanent.
-//!    An operation that was fully applied may be rejected, since the state is already complete.
-//!    E.g., `CreateCollection` rejects a collection that is already there.
-//! 2. Emit only the actions left to reach the goal state, each idempotent, and the action that
-//!    records the operation as applied last.
+//! 1. Never reject a partially applied operation; rejection would make partial state permanent.
+//!    A fully applied operation may be rejected because state is already complete.
+//! 2. Emit only missing idempotent actions.
+//!    Emit the action that records the operation as applied last.
 //!
-//! Rule 2 is measured against [`ClusterState`]. An action whose applier also does work outside it,
-//! such as propagating a payload index to local shards, is emitted even when the state already
-//! matches.
+//! Missing actions are determined from [`ClusterState`]. Actions that also affect state outside
+//! [`ClusterState`], such as propagating a payload index to local shards, are emitted even when
+//! cluster state already matches.
 
 pub mod action;
 pub mod state;
@@ -34,7 +31,7 @@ use collection::config::{
     self, CollectionConfigInternal, CollectionParams, PayloadStorageParams, ShardingMethod,
     WalConfig,
 };
-use collection::operations::config_diff::DiffConfig as _;
+use collection::operations::config_diff::{DiffConfig as _, OptimizersConfigDiff};
 use collection::operations::types::VectorsConfig;
 use collection::optimizers_builder::OptimizersConfig;
 use collection::shards::CollectionId;
@@ -43,7 +40,10 @@ use collection::shards::transfer::ShardTransferMethod;
 use segment::data_types::collection_defaults::CollectionConfigDefaults;
 use segment::types::HnswConfig;
 
-pub use self::action::{Action, CollectionConfigDiff, apply_collection_config_diffs};
+pub use self::action::{
+    Action, CollectionConfigDiff, LocalShardInitMode, TransferOutcome,
+    apply_collection_config_diffs,
+};
 pub use self::state::ClusterState;
 use super::errors::StorageResult;
 use crate::content_manager::collection_meta_ops::*;
@@ -70,12 +70,7 @@ impl ConsensusStateMachine {
         &self.context
     }
 
-    /// Replace the state of one collection with state read back from `TableOfContent`, `None`
-    /// removing it.
-    ///
-    /// Actions are the only way an *operation* changes the state. This is for the shadow run,
-    /// after an operation the machine does not model: the collections that operation touched
-    /// are read back, so the next one plans against what the legacy path left behind.
+    /// Replace collection state after an unmodeled or external change
     pub fn resync_collection(
         &mut self,
         collection: &CollectionId,
@@ -139,31 +134,42 @@ impl ConsensusStateMachine {
             }
 
             CollectionMetaOperations::UpdateCollection(operation) => {
-                // TODO:
-                //
-                // Replica changes remove a replica *and* abort its transfers and resharding,
-                // so they need `Transfer::Abort`/`Resharding::Abort` to be implemented first
-
-                if operation.has_shard_replica_changes() {
-                    ApplyOutcome::NotCovered
-                } else {
-                    ApplyOutcome::new(self.state.plan_update_collection(operation))
-                }
+                ApplyOutcome::new(self.state.plan_update_collection(&self.context, operation))
             }
 
             CollectionMetaOperations::DeleteCollection(operation) => {
                 ApplyOutcome::Accepted(self.state.plan_delete_collection(operation))
             }
 
-            CollectionMetaOperations::CreateShardKey(_)
-            | CollectionMetaOperations::DropShardKey(_)
-            | CollectionMetaOperations::SetShardReplicaState(_)
-            | CollectionMetaOperations::TransferShard(_, _)
-            | CollectionMetaOperations::Resharding(_, _) => ApplyOutcome::NotCovered,
-
             CollectionMetaOperations::ChangeAliases(operation) => {
                 ApplyOutcome::new(self.state.plan_change_aliases(operation))
             }
+
+            CollectionMetaOperations::CreateShardKey(operation) => {
+                ApplyOutcome::new(self.state.plan_create_shard_key(&self.context, operation))
+            }
+
+            CollectionMetaOperations::DropShardKey(operation) => {
+                ApplyOutcome::new(self.state.plan_drop_shard_key(&self.context, operation))
+            }
+
+            CollectionMetaOperations::Resharding(collection, operation) => {
+                let result = self
+                    .state
+                    .plan_resharding(&self.context, collection, operation);
+
+                ApplyOutcome::new(result)
+            }
+
+            CollectionMetaOperations::TransferShard(collection, operation) => ApplyOutcome::new(
+                self.state
+                    .plan_transfer(&self.context, collection, operation),
+            ),
+
+            CollectionMetaOperations::SetShardReplicaState(operation) => ApplyOutcome::new(
+                self.state
+                    .plan_set_shard_replica_state(&self.context, operation),
+            ),
 
             CollectionMetaOperations::CreateNamedVector(operation) => {
                 ApplyOutcome::new(self.state.plan_create_named_vector(operation))
@@ -208,6 +214,7 @@ pub struct NodeContext {
     pub max_collections: Option<usize>,
     pub wal: WalConfig,
     pub optimizers: OptimizersConfig,
+    pub optimizers_overwrite: Option<OptimizersConfigDiff>,
     pub hnsw_index: HnswConfig,
     pub payload: Option<PayloadStorageParams>,
     /// Mirrors the deprecated storage config flag of the same name, which `payload` overrides
@@ -220,8 +227,7 @@ impl NodeContext {
         peer_id: PeerId,
         is_distributed: bool,
     ) -> Self {
-        // Naming every field forces a new storage config option to be either read here, or
-        // dismissed as one no operation reads
+        // Keep ignored fields explicit so StorageConfig additions require review
         #[expect(deprecated)]
         let StorageConfig {
             collection,
@@ -237,7 +243,7 @@ impl NodeContext {
             snapshots_path: _,
             snapshots_config: _,
             temp_path: _,
-            optimizers_overwrite: _,
+            optimizers_overwrite,
             performance: _,
             hnsw_global_config: _,
             mmap_advice: _,
@@ -247,8 +253,7 @@ impl NodeContext {
             handle_collection_load_errors: _,
             recovery_mode: _,
             update_concurrency: _,
-            // Seeds the quota manager on first start only; `SetQuotaConfig` carries the config
-            // consensus decides on
+            // Only the initial value; consensus owns later changes
             quotas: _,
         } = config;
 
@@ -260,6 +265,7 @@ impl NodeContext {
             max_collections: *max_collections,
             wal: wal.clone(),
             optimizers: optimizers.clone(),
+            optimizers_overwrite: optimizers_overwrite.clone(),
             hnsw_index: *hnsw_index,
             payload: *payload,
             on_disk_payload: *on_disk_payload,

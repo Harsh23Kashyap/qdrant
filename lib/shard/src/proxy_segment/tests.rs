@@ -1,6 +1,7 @@
 use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::flags::{FeatureFlags, init_feature_flags};
 use common::tar_ext;
 use common::types::DeferredBehavior;
 use fs_err::File;
@@ -95,7 +96,7 @@ fn test_proxy_deleted_mask_resync_after_race_window_write() {
 
         // Keep a handle so we can write to the wrapped segment around the proxy lifecycle.
         let wrapped_handle = original_segment.clone();
-        let proxy = UnsyncedProxySegment::new(original_segment);
+        let proxy = UnsyncedProxySegment::new(original_segment).unwrap();
         (proxy, wrapped_handle)
     };
 
@@ -531,6 +532,62 @@ fn test_take_snapshot() {
     }
 }
 
+/// A persisted pending changes log is part of the segment snapshot and manifest, so full,
+/// partial and streamed snapshots all carry it and recovery can replay it.
+#[test]
+fn test_take_snapshot_includes_pending_changes_log() {
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let original_segment = LockedSegment::new(build_segment_1(dir.path()));
+
+    let hw_cell = HardwareCounterCell::new();
+
+    let mut proxy_segment = ProxySegment::new(original_segment);
+    let log_file_name = proxy_segment
+        .pending_changes
+        .log_path()
+        .file_name()
+        .unwrap()
+        .to_owned();
+    proxy_segment.delete_point(102, 1.into(), &hw_cell).unwrap();
+    // Persist the pending delete into the pending changes log
+    proxy_segment.flush(false).unwrap();
+    // The pending changes log is part of the segment manifest, with an explicit version matching
+    // the proxy's own version
+    let manifest = proxy_segment.get_segment_manifest().unwrap();
+    let file_version = manifest
+        .file_version(std::path::Path::new(&log_file_name))
+        .expect("pending changes log must be listed in the segment manifest");
+    assert_eq!(file_version, proxy_segment.version());
+    assert_eq!(file_version, manifest.segment_version);
+
+    // The pending changes log is included in the snapshot files
+    let snapshot_file = Builder::new().suffix(".snapshot.tar").tempfile().unwrap();
+    let tar = tar_ext::BuilderExt::new_seekable_owned(File::create(snapshot_file.path()).unwrap());
+    let temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
+    proxy_segment
+        .take_snapshot(temp_dir.path(), &tar, SnapshotFormat::Streamable, None)
+        .unwrap();
+    tar.blocking_finish().unwrap();
+
+    let mut tar = tar::Archive::new(File::open(snapshot_file.path()).unwrap());
+    let has_pending_changes_log = tar.entries_with_seek().unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .unwrap()
+            .ends_with(std::path::Path::new("files").join(&log_file_name))
+    });
+    assert!(
+        has_pending_changes_log,
+        "snapshot must carry the pending changes log",
+    );
+}
+
 #[test]
 fn test_point_vector_count() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
@@ -623,6 +680,11 @@ fn test_point_vector_count_multivec() {
 
 #[test]
 fn test_proxy_segment_flush() {
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
     let tmp_dir = tempfile::Builder::new()
         .prefix("segment_dir")
         .tempdir()
@@ -633,20 +695,283 @@ fn test_proxy_segment_flush() {
     let mut proxy_segment = ProxySegment::new(locked_wrapped_segment.clone());
 
     let flushed_version_1 = proxy_segment.flush(false).unwrap();
+    assert_eq!(flushed_version_1, proxy_segment.version());
 
     proxy_segment
         .delete_point(100, 2.into(), &HardwareCounterCell::new())
         .unwrap();
 
+    // The pending delete is not persisted yet, so it caps the persistent version
+    assert_eq!(proxy_segment.persistent_version(), flushed_version_1);
+
     let flushed_version_2 = proxy_segment.flush(false).unwrap();
 
-    assert_eq!(flushed_version_2, flushed_version_1);
+    // Flushing persisted the pending delete into the pending changes log, so the proxy is fully
+    // persisted and does not hold back acknowledging the WAL
+    assert_eq!(flushed_version_2, 100);
+    assert_eq!(flushed_version_2, proxy_segment.version());
+    assert!(
+        proxy_segment.pending_changes.log_path().is_file(),
+        "flush must persist pending changes log into the wrapped segment directory",
+    );
 
-    let version_after_delete = proxy_segment.version();
+    // An operation that buffers nothing (delete of an absent point) must not cap the persistent
+    // version either
+    proxy_segment
+        .delete_point(101, 12345.into(), &HardwareCounterCell::new())
+        .unwrap();
+    let flushed_version_3 = proxy_segment.flush(false).unwrap();
+    assert_eq!(flushed_version_3, 101);
+    assert_eq!(flushed_version_3, proxy_segment.version());
+}
 
-    // We can never fully persist proxy segment, as list of deleted points is always in-memory only.
-    // So we have to keep WAL for deleted points.
-    assert!(version_after_delete > flushed_version_2);
+/// Pending proxy changes are persisted on flush, survive dropping the proxy without propagation
+/// (e.g. a crash) and are replayed onto the actual segment when it is loaded again.
+#[test]
+fn test_pending_changes_recovered_on_restart() {
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let hw_counter = HardwareCounterCell::new();
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("segment_dir")
+        .tempdir()
+        .unwrap();
+
+    let locked_wrapped_segment = LockedSegment::new(build_segment_1(tmp_dir.path()));
+    let wrapped_segment_dir = locked_wrapped_segment.get().read().data_path();
+
+    let mut proxy_segment = ProxySegment::new(locked_wrapped_segment.clone());
+    let log_path = proxy_segment.pending_changes.log_path().to_path_buf();
+
+    proxy_segment
+        .delete_point(100, 2.into(), &hw_counter)
+        .unwrap();
+    proxy_segment
+        .apply_field_index(
+            101,
+            "color".parse().unwrap(),
+            PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword),
+            vec![],
+        )
+        .unwrap();
+
+    // Flush persists the pending changes log; the wrapped segment itself never sees the changes
+    let flushed_version = proxy_segment.flush(false).unwrap();
+    assert_eq!(flushed_version, 101);
+    // The proxy flush durably persisted the wrapped segment's own (unrelated) base state; this is
+    // the persisted version the reloaded segment starts from below
+    let wrapped_persisted_version = locked_wrapped_segment.get().read().persistent_version();
+
+    // "Crash": drop the proxy without propagating to the wrapped segment
+    drop(proxy_segment);
+    drop(locked_wrapped_segment);
+    assert!(log_path.is_file());
+
+    // "Restart": load the segment from disk and recover the pending changes, as done on start-up
+    let mut segment = segment::segment_constructor::load_segment(
+        &wrapped_segment_dir,
+        uuid::Uuid::nil(),
+        None,
+        &std::sync::atomic::AtomicBool::new(false),
+        false,
+    )
+    .unwrap();
+
+    // Before recovery the segment does not know about the buffered operations
+    assert!(segment.has_point(2.into(), DeferredBehavior::VisibleOnly));
+
+    let recovered = segment::pending_changes::recover_pending_changes(
+        &mut segment,
+        segment::pending_changes::PersistedProxyChanges::Replay,
+    )
+    .unwrap();
+    assert_eq!(recovered.replayed, 2);
+
+    assert!(!segment.has_point(2.into(), DeferredBehavior::VisibleOnly));
+    assert!(
+        segment
+            .get_indexed_fields()
+            .contains_key(&"color".parse().unwrap())
+    );
+    assert_eq!(segment.version(), 101);
+    assert_eq!(recovered.ready_at, 101);
+    // Recovery does not flush; the log file must survive until the segment durably persists
+    // past `ready_at`, so the caller (the segment holder, via a post-flush action) can safely
+    // remove it
+    assert_eq!(segment.persistent_version(), wrapped_persisted_version);
+    assert!(log_path.is_file());
+
+    segment.flush(true).unwrap();
+    assert_eq!(segment.persistent_version(), 101);
+    for path in &recovered.log_files {
+        fs_err::remove_file(path).unwrap();
+    }
+    assert!(!log_path.is_file());
+}
+
+/// Unwrapping a proxy leaves the pending changes log in place (deleting it before the wrapped
+/// segment flushed the propagated changes would not be crash safe). A new proxy on the same
+/// segment never adopts that file though: it always starts a fresh, uniquely named one, leaving
+/// the old file untouched.
+#[test]
+fn test_unproxy_leaves_pending_changes_log_without_adoption() {
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let hw_counter = HardwareCounterCell::new();
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("segment_dir")
+        .tempdir()
+        .unwrap();
+
+    let locked_wrapped_segment = LockedSegment::new(build_segment_1(tmp_dir.path()));
+    let wrapped_segment_dir = locked_wrapped_segment.get().read().data_path();
+
+    let mut proxy_segment = ProxySegment::new(locked_wrapped_segment.clone());
+    let log_path = proxy_segment.pending_changes.log_path().to_path_buf();
+    proxy_segment
+        .delete_point(100, 2.into(), &hw_counter)
+        .unwrap();
+    proxy_segment.flush(false).unwrap();
+
+    // Unproxy: propagate pending changes into the wrapped segment, then drop the proxy
+    proxy_segment.propagate_to_wrapped().unwrap();
+    assert!(proxy_segment.changes().deleted_points().is_empty());
+    drop(proxy_segment);
+
+    assert!(
+        !locked_wrapped_segment
+            .get()
+            .read()
+            .has_point(2.into(), DeferredBehavior::VisibleOnly)
+    );
+    assert!(
+        log_path.is_file(),
+        "unproxying must leave the pending changes log in place",
+    );
+
+    // A new proxy on the same segment does not adopt the old log: it starts a fresh, uniquely
+    // named one, and reports only the wrapped segment's own persisted version — it does not know
+    // about the old proxy's now-orphaned file (those operations are still safely recovered from
+    // there on restart, see `recover_pending_changes`)
+    let wrapped_persistent_version = locked_wrapped_segment.get().read().persistent_version();
+    let mut proxy_segment = ProxySegment::new(locked_wrapped_segment.clone());
+    let new_log_path = proxy_segment.pending_changes.log_path().to_path_buf();
+    assert_ne!(new_log_path, log_path);
+    assert_eq!(
+        proxy_segment.persistent_version(),
+        wrapped_persistent_version
+    );
+    assert!(proxy_segment.changes().deleted_points().is_empty());
+
+    proxy_segment
+        .delete_point(110, 3.into(), &hw_counter)
+        .unwrap();
+    proxy_segment.flush(false).unwrap();
+
+    // The old file still holds only the first proxy's entry, the new file only the second's
+    let loaded_old = segment::pending_changes::PendingChanges::load(&log_path).unwrap();
+    assert_eq!(loaded_old.deleted_points().len(), 1);
+    assert_eq!(loaded_old.persisted_version(), 100);
+
+    let loaded_new = segment::pending_changes::PendingChanges::load(&new_log_path).unwrap();
+    assert_eq!(loaded_new.deleted_points().len(), 1);
+    assert_eq!(loaded_new.persisted_version(), 110);
+
+    assert_eq!(
+        segment::pending_changes::list_pending_changes_log_files(&wrapped_segment_dir).len(),
+        2,
+    );
+}
+
+/// Each proxy layer persists its pending changes into a dedicated log file; on restart all files
+/// are replayed onto the segment, inner most layer first.
+#[test]
+fn test_double_proxy_pending_changes_levels() {
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let hw_counter = HardwareCounterCell::new();
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("segment_dir")
+        .tempdir()
+        .unwrap();
+
+    let locked_wrapped_segment = LockedSegment::new(build_segment_1(tmp_dir.path()));
+    let wrapped_segment_dir = locked_wrapped_segment.get().read().data_path();
+
+    // Inner proxy (e.g. an ongoing optimization) buffers a delete of point 2
+    let mut inner_proxy = ProxySegment::new(locked_wrapped_segment.clone());
+    let inner_log_path = inner_proxy.pending_changes.log_path().to_path_buf();
+    inner_proxy
+        .delete_point(100, 2.into(), &hw_counter)
+        .unwrap();
+
+    // Outer proxy (e.g. an ongoing snapshot) wraps the inner proxy and buffers a delete of
+    // point 3
+    let locked_inner_proxy = LockedSegment::from(inner_proxy);
+    let mut outer_proxy = ProxySegment::new(locked_inner_proxy.clone());
+    let outer_log_path = outer_proxy.pending_changes.log_path().to_path_buf();
+    outer_proxy
+        .delete_point(101, 3.into(), &hw_counter)
+        .unwrap();
+
+    // Flushing the outer proxy persists its own pending changes and passes the flush along to
+    // the inner proxy, which persists its own as well
+    let flushed_version = outer_proxy.flush(false).unwrap();
+    assert_eq!(flushed_version, 101);
+
+    let log_files = segment::pending_changes::list_pending_changes_log_files(&wrapped_segment_dir);
+    assert_eq!(
+        log_files,
+        vec![inner_log_path, outer_log_path],
+        "each proxy layer must persist into its own log file, inner most first",
+    );
+
+    // "Crash": drop both proxies without propagating, then load the segment and recover
+    drop(outer_proxy);
+    drop(locked_inner_proxy);
+    drop(locked_wrapped_segment);
+
+    let mut segment = segment::segment_constructor::load_segment(
+        &wrapped_segment_dir,
+        uuid::Uuid::nil(),
+        None,
+        &std::sync::atomic::AtomicBool::new(false),
+        false,
+    )
+    .unwrap();
+
+    let recovered = segment::pending_changes::recover_pending_changes(
+        &mut segment,
+        segment::pending_changes::PersistedProxyChanges::Replay,
+    )
+    .unwrap();
+    assert_eq!(recovered.replayed, 2);
+
+    assert!(!segment.has_point(2.into(), DeferredBehavior::VisibleOnly));
+    assert!(!segment.has_point(3.into(), DeferredBehavior::VisibleOnly));
+    assert_eq!(segment.version(), 101);
+    assert_eq!(recovered.ready_at, 101);
+    assert_eq!(
+        segment::pending_changes::list_pending_changes_log_files(&wrapped_segment_dir),
+        recovered.log_files,
+    );
+
+    segment.flush(true).unwrap();
+    for path in &recovered.log_files {
+        fs_err::remove_file(path).unwrap();
+    }
+    assert!(
+        segment::pending_changes::list_pending_changes_log_files(&wrapped_segment_dir).is_empty()
+    );
 }
 
 #[test]
@@ -747,8 +1072,8 @@ fn test_propagate_to_wrapped_vector_name_and_index() {
         .unwrap();
 
     // Both changes are pending on the proxy, not yet visible on the wrapped segment.
-    assert!(!proxy_segment.get_vector_name_changes().is_empty());
-    assert!(!proxy_segment.get_index_changes().is_empty());
+    assert!(!proxy_segment.changes().vector_name_changes().is_empty());
+    assert!(!proxy_segment.changes().index_changes().is_empty());
     assert!(
         !wrapped_segment
             .get()
@@ -768,8 +1093,8 @@ fn test_propagate_to_wrapped_vector_name_and_index() {
     proxy_segment.propagate_to_wrapped().unwrap();
 
     // The proxy has drained its pending changes...
-    assert!(proxy_segment.get_vector_name_changes().is_empty());
-    assert!(proxy_segment.get_index_changes().is_empty());
+    assert!(proxy_segment.changes().vector_name_changes().is_empty());
+    assert!(proxy_segment.changes().index_changes().is_empty());
 
     // ...and both changes actually landed on the wrapped segment.
     assert!(
@@ -787,5 +1112,415 @@ fn test_propagate_to_wrapped_vector_name_and_index() {
             .get_indexed_fields()
             .get(&field_name),
         Some(&field_schema),
+    );
+}
+
+/// Dropping the data of a proxy segment removes the wrapped segment directory, taking the
+/// pending changes log with it.
+#[test]
+fn test_drop_data_removes_pending_changes_log() {
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let hw_counter = HardwareCounterCell::new();
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("segment_dir")
+        .tempdir()
+        .unwrap();
+
+    let locked_wrapped_segment = LockedSegment::new(build_segment_1(tmp_dir.path()));
+    let wrapped_segment_dir = locked_wrapped_segment.get().read().data_path();
+
+    let mut proxy_segment = ProxySegment::new(locked_wrapped_segment);
+    let log_path = proxy_segment.pending_changes.log_path().to_path_buf();
+    proxy_segment
+        .delete_point(100, 2.into(), &hw_counter)
+        .unwrap();
+    proxy_segment.flush(false).unwrap();
+    assert!(log_path.is_file());
+
+    proxy_segment.drop_data().unwrap();
+    assert!(!wrapped_segment_dir.exists());
+}
+
+/// Replace the file at `path` with a directory, so writing it fails deterministically.
+fn block_file_write(path: &std::path::Path) {
+    fs_err::remove_file(path).unwrap();
+    fs_err::create_dir(path).unwrap();
+}
+
+/// A segment's persisted version may only advance once its flush fully completed. The proxy
+/// persists its pending changes before passing the flush along to the wrapped segment, so a
+/// failing wrapped flush leaves the proxy claiming durability the segment does not have.
+#[test]
+fn test_persistent_version_not_advanced_by_failed_flush() {
+    let hw_counter = HardwareCounterCell::new();
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("segment_dir")
+        .tempdir()
+        .unwrap();
+
+    let wrapped_segment = build_segment_1(tmp_dir.path());
+    let wrapped_segment_dir = wrapped_segment.data_path();
+    assert_eq!(wrapped_segment.version(), 6);
+    assert_eq!(wrapped_segment.persistent_version(), 0);
+
+    block_file_write(&wrapped_segment_dir.join("segment.json"));
+
+    let mut proxy_segment = ProxySegment::new(LockedSegment::new(wrapped_segment));
+    proxy_segment
+        .delete_point(100, 2.into(), &hw_counter)
+        .unwrap();
+
+    assert!(proxy_segment.flush(false).is_err());
+    assert_eq!(
+        proxy_segment.persistent_version(),
+        0,
+        "a failed flush must not advance the persisted version (version: {})",
+        proxy_segment.version(),
+    );
+}
+
+/// The WAL is acknowledged up to the persisted version the segments report. A proxy persists its
+/// own pending changes only after the layer beneath it is durable, so a layer that fails to
+/// persist holds back every layer above it. Otherwise the outer layer would report its changes as
+/// durable while the inner layer's are not on disk anywhere, and the acknowledge would pass both.
+#[test]
+fn test_persistent_version_held_back_by_failed_inner_flush() {
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let hw_counter = HardwareCounterCell::new();
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("segment_dir")
+        .tempdir()
+        .unwrap();
+
+    let wrapped_segment = build_segment_1(tmp_dir.path());
+    let wrapped_version = wrapped_segment.version();
+    let locked_wrapped_segment = LockedSegment::new(wrapped_segment);
+
+    let mut inner_proxy = ProxySegment::new(locked_wrapped_segment.clone());
+    let inner_log = inner_proxy.pending_changes.log_path().to_path_buf();
+    inner_proxy.delete_point(99, 1.into(), &hw_counter).unwrap();
+
+    let mut outer_proxy = ProxySegment::new(LockedSegment::from(inner_proxy));
+    outer_proxy
+        .delete_point(100, 2.into(), &hw_counter)
+        .unwrap();
+
+    // Fail the inner layer at persisting its pending changes: the log file only gets created on
+    // the first flush, so a directory in its place makes writing it fail. The flush still gets as
+    // far as the wrapped segment, which is persisted first
+    fs_err::create_dir(&inner_log).unwrap();
+    assert!(outer_proxy.flush(true).is_err());
+
+    let durable = locked_wrapped_segment.get().read().persistent_version();
+    let outer_persisted = outer_proxy.persistent_version();
+    assert!(
+        outer_persisted <= durable,
+        "outer layer reports version {outer_persisted} as durable while only {durable} is on disk",
+    );
+    // The flush did persist the wrapped segment before failing, so the above is not trivially zero
+    assert_eq!(durable, wrapped_version);
+}
+
+/// Once a proxy propagated its buffered changes into the wrapped segment and the segment flushed,
+/// the log entries are dead weight. They must not accumulate across proxy generations.
+#[test]
+fn test_pending_changes_log_is_compacted_after_propagation() {
+    init_feature_flags(FeatureFlags {
+        persist_proxy_segments: true,
+        ..Default::default()
+    });
+
+    let hw_counter = HardwareCounterCell::new();
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("segment_dir")
+        .tempdir()
+        .unwrap();
+
+    let locked_wrapped_segment = LockedSegment::new(build_segment_1(tmp_dir.path()));
+
+    let mut first_cycle_len = 0;
+    for point_id in 1..=5u64 {
+        let mut proxy_segment = ProxySegment::new(locked_wrapped_segment.clone());
+        // Each proxy generation starts a fresh, uniquely named log file (see
+        // `test_unproxy_leaves_pending_changes_log_without_adoption`), so its size must be read
+        // fresh every cycle rather than reused from a previous generation's path
+        let log_path = proxy_segment.pending_changes.log_path().to_path_buf();
+        proxy_segment
+            .delete_point(100 + point_id, point_id.into(), &hw_counter)
+            .unwrap();
+        proxy_segment.flush(false).unwrap();
+        proxy_segment.propagate_to_wrapped().unwrap();
+        drop(proxy_segment);
+        locked_wrapped_segment.get().read().flush(true).unwrap();
+
+        let log_len = fs_err::metadata(&log_path).unwrap().len();
+        if point_id == 1 {
+            first_cycle_len = log_len;
+        }
+        assert_eq!(
+            log_len, first_cycle_len,
+            "pending changes log grew to {log_len} bytes after {point_id} propagated cycles",
+        );
+    }
+}
+
+/// The pending changes log is registered in the segment manifest, so a partial snapshot can tell
+/// whether the receiver's copy is up to date. Its version must therefore track the log's content,
+/// not the frozen version of the wrapped segment.
+#[test]
+fn test_pending_changes_log_manifest_version_tracks_content() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let hw_cell = HardwareCounterCell::new();
+
+    let mut proxy_segment = ProxySegment::new(LockedSegment::new(build_segment_1(dir.path())));
+    let log_file_name = proxy_segment
+        .pending_changes
+        .log_path()
+        .file_name()
+        .unwrap()
+        .to_owned();
+    proxy_segment.delete_point(102, 1.into(), &hw_cell).unwrap();
+    proxy_segment.flush(false).unwrap();
+    let old_version = proxy_segment
+        .get_segment_manifest()
+        .unwrap()
+        .file_version(std::path::Path::new(&log_file_name))
+        .unwrap();
+
+    proxy_segment.delete_point(103, 2.into(), &hw_cell).unwrap();
+    proxy_segment.flush(false).unwrap();
+    let new_version = proxy_segment
+        .get_segment_manifest()
+        .unwrap()
+        .file_version(std::path::Path::new(&log_file_name))
+        .unwrap();
+
+    assert!(
+        new_version > old_version,
+        "appending to the log must bump its manifest version ({old_version} -> {new_version})",
+    );
+}
+
+/// A text-indexed segment of `count` points, point `i` holding a document
+/// whose term counts vary with `i`, so BM25 ranks them apart.
+fn build_text_segment(path: &std::path::Path, count: u64) -> segment::segment::Segment {
+    use segment::data_types::index::TextIndexParams;
+    use segment::json_path::JsonPath;
+    use segment::payload_json;
+    use segment::types::{PayloadFieldSchema, PayloadSchemaParams};
+
+    let hw_counter = HardwareCounterCell::new();
+    let mut segment = empty_segment(path);
+    let params = TextIndexParams {
+        phrase_matching: Some(true),
+        ..TextIndexParams::default()
+    };
+    segment
+        .create_field_index(
+            1,
+            &JsonPath::new("text"),
+            Some(&PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(
+                params,
+            ))),
+            &hw_counter,
+        )
+        .unwrap();
+    for i in 0..count {
+        let op_num = 2 + i;
+        let text = ["alpha"; 5][..(i % 5 + 1) as usize].join(" ")
+            + &" beta".repeat((i % 3) as usize)
+            + &" gamma".repeat((i % 7) as usize);
+        segment
+            .upsert_point(
+                op_num,
+                i.into(),
+                only_default_vector(&[1.0, 0.0, 0.0, 0.0]),
+                &hw_counter,
+            )
+            .unwrap();
+        segment
+            .set_payload(
+                op_num,
+                i.into(),
+                &payload_json! { "text": text },
+                &None,
+                &hw_counter,
+            )
+            .unwrap();
+    }
+    segment
+}
+
+/// A proxy scores BM25 as its wrapped segment does, minus the points deleted
+/// through it, on both of its deletion paths: the synced deleted mask of a
+/// proxy over an original segment, and the id filter a proxy over another
+/// proxy falls back to.
+#[test]
+fn test_score_bm25_hides_proxy_deletions() {
+    use segment::data_types::index::TextIndexParams;
+    use segment::entry::ReadSegmentEntry;
+    use segment::index::field_index::full_text_index::Bm25Params;
+    use segment::json_path::JsonPath;
+
+    let _scoring = TextIndexParams::override_scoring(true);
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let count = 60;
+    let original_segment = LockedSegment::new(build_text_segment(dir.path(), count));
+    let hw_counter = HardwareCounterCell::new();
+
+    let field = JsonPath::new("text");
+    let terms = ["alpha".to_owned(), "gamma".to_owned()];
+    let score = |segment: &dyn ReadSegmentEntry, stats_from: &dyn ReadSegmentEntry| {
+        let mut query_context = QueryContext::default();
+        query_context.init_text_stats(&field, terms.iter().cloned());
+        stats_from.fill_query_context(&mut query_context).unwrap();
+        segment
+            .score_bm25(
+                &field,
+                &terms,
+                Bm25Params::default(),
+                &WithPayload::default(),
+                &false.into(),
+                None,
+                count as usize,
+                &query_context.get_segment_query_context(),
+            )
+            .unwrap()
+    };
+
+    let mut proxy_segment = ProxySegment::new(original_segment.clone());
+    let deleted: Vec<PointIdType> = [3u64, 8, 20, 41].map(PointIdType::from).to_vec();
+    for (op, &id) in deleted.iter().enumerate() {
+        proxy_segment
+            .delete_point(100 + op as SeqNumberType, id, &hw_counter)
+            .unwrap();
+    }
+    assert!(proxy_segment.deleted_mask.is_some());
+
+    // Statistics from the wrapped segment on both sides: the proxy forwards
+    // its gather there, so this isolates the exclusion.
+    let wrapped = original_segment.get().read();
+    let expected: Vec<ScoredPoint> = score(&*wrapped, &*wrapped)
+        .into_iter()
+        .filter(|point| !deleted.contains(&point.id))
+        .collect();
+    assert_eq!(expected.len(), count as usize - deleted.len());
+    assert_eq!(score(&proxy_segment, &*wrapped), expected);
+    drop(wrapped);
+
+    let double_proxy = ProxySegment::new(LockedSegment::from(proxy_segment));
+    assert!(double_proxy.deleted_mask.is_none());
+    let mut double_proxy = double_proxy;
+    double_proxy
+        .delete_point(200, PointIdType::from(50), &hw_counter)
+        .unwrap();
+    let wrapped = original_segment.get().read();
+    let expected: Vec<ScoredPoint> = expected
+        .into_iter()
+        .filter(|point| point.id != PointIdType::from(50))
+        .collect();
+    assert_eq!(score(&double_proxy, &*wrapped), expected);
+}
+
+/// A pending change that replaces or drops the wrapped segment's text index
+/// makes the proxy score nothing and contribute no text statistics for that
+/// field, as `search_batch` does for a stale vector: the wrapped index is not
+/// the one the proxy presents. A change the wrapped index already satisfies
+/// leaves it serving.
+#[test]
+fn test_bm25_skips_a_stale_wrapped_text_index() {
+    use segment::data_types::index::{TextIndexParams, TokenizerType};
+    use segment::entry::ReadSegmentEntry;
+    use segment::index::field_index::full_text_index::Bm25Params;
+    use segment::json_path::JsonPath;
+    use segment::types::{PayloadFieldSchema, PayloadSchemaParams};
+
+    let _scoring = TextIndexParams::override_scoring(true);
+    let hw_counter = HardwareCounterCell::new();
+    let field = JsonPath::new("text");
+    let terms = ["alpha".to_owned(), "gamma".to_owned()];
+    let count = 20;
+    let wrapped_schema = || {
+        PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(TextIndexParams {
+            phrase_matching: Some(true),
+            ..TextIndexParams::default()
+        }))
+    };
+    let other_schema =
+        PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(TextIndexParams {
+            tokenizer: TokenizerType::Whitespace,
+            phrase_matching: Some(true),
+            ..TextIndexParams::default()
+        }));
+
+    // (documents gathered, points scored) through a proxy after `change`.
+    let through_proxy = |change: &dyn Fn(&mut ProxySegment)| {
+        let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+        let wrapped = LockedSegment::new(build_text_segment(dir.path(), count));
+        let mut proxy = ProxySegment::new(wrapped);
+        change(&mut proxy);
+        let mut query_context = QueryContext::default();
+        query_context.init_text_stats(&field, terms.iter().cloned());
+        proxy.fill_query_context(&mut query_context).unwrap();
+        let documents = query_context.mut_text_stats()[&field].documents;
+        let scored = proxy
+            .score_bm25(
+                &field,
+                &terms,
+                Bm25Params::default(),
+                &WithPayload::default(),
+                &false.into(),
+                None,
+                count as usize,
+                &query_context.get_segment_query_context(),
+            )
+            .unwrap()
+            .len();
+        (documents, scored)
+    };
+
+    let serving = (count as usize, count as usize);
+    assert_eq!(through_proxy(&|_| {}), serving, "no pending change");
+    assert_eq!(
+        through_proxy(&|proxy| {
+            proxy.delete_field_index(100, &field).unwrap();
+        }),
+        (0, 0),
+        "pending delete",
+    );
+    assert_eq!(
+        through_proxy(&|proxy| {
+            proxy
+                .create_field_index(100, &field, Some(&other_schema), &hw_counter)
+                .unwrap();
+        }),
+        (0, 0),
+        "pending create of another schema",
+    );
+    assert_eq!(
+        through_proxy(&|proxy| {
+            proxy
+                .delete_field_index_if_incompatible(100, &field, &other_schema)
+                .unwrap();
+        }),
+        (0, 0),
+        "pending replacement the wrapped index does not match",
+    );
+    assert_eq!(
+        through_proxy(&|proxy| {
+            proxy
+                .delete_field_index_if_incompatible(100, &field, &wrapped_schema())
+                .unwrap();
+        }),
+        serving,
+        "pending replacement the wrapped index already matches",
     );
 }

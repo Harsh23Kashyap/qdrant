@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use collection::collection_state;
 use collection::shards::CollectionId;
+use semver::Version;
 
 use super::Action;
 use crate::content_manager::alias_mapping::AliasMapping;
@@ -12,14 +13,7 @@ use crate::content_manager::errors::{StorageError, StorageResult};
 use crate::quota::QuotaConfig;
 use crate::types::{PeerAddressById, PeerMetadataById};
 
-/// Cluster state consensus decides on.
-///
-/// Same fields as [`SnapshotData`], the state we serialize into Raft snapshots, so a copy can be
-/// compared against state read back from `TableOfContent` field by field. Types match too, except
-/// that `SnapshotData` wraps the quota config in an `Option` to read snapshots taken before
-/// global quotas existed.
-///
-/// `TableOfContent` stays the source of truth; this is the copy we validate operations against.
+/// Cluster state modeled by consensus state machine. Mirrors [`SnapshotData`].
 ///
 /// [`SnapshotData`]: crate::content_manager::consensus_manager::SnapshotData
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -55,5 +49,22 @@ impl ClusterState {
         }
 
         Ok(resolved)
+    }
+
+    /// Whether every known peer runs at least `version`.
+    /// Implementation intentionally matches `ChannelService::all_peers_at_version`.
+    pub fn all_peers_at_version(&self, version: &Version) -> bool {
+        // TODO:
+        // Check that peer address map and peer metadata map contain the same peers
+        // and each peer matches required version
+
+        // More peer addresses than metadata means at least one version is unknown
+        if self.peer_address_by_id.len() > self.peer_metadata_by_id.len() {
+            return false;
+        }
+
+        self.peer_metadata_by_id
+            .values()
+            .all(|metadata| metadata.version() >= version)
     }
 }

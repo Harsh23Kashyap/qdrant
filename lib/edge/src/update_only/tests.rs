@@ -193,22 +193,25 @@ fn delete_batch_tombstones_points_in_immutable_segments() {
 /// preallocation nor mmap exists.
 #[cfg(not(windows))]
 mod store {
+    use std::collections::HashMap;
     use std::path::Path;
 
     use common::universal_io::{MmapFile, MmapFs};
+    use segment::data_types::vectors::{VectorInternal, VectorStructInternal};
     use segment::payload_json;
     use segment::payload_storage::update_only::UpdateOnlyPayloadStorage;
-    use segment::types::{Filter, Payload, WithPayloadInterface, WithVector};
+    use segment::types::{Distance, Filter, Payload, WithPayloadInterface, WithVector};
     use shard::files::SEGMENTS_PATH;
     use shard::operations::point_ops::PointInsertOperationsInternal::PointsList;
     use shard::operations::point_ops::PointOperations::{UpsertPoints, UpsertPointsConditional};
     use shard::operations::point_ops::{
-        ConditionalInsertOperationInternal, PointStructPersisted, UpdateMode,
+        ConditionalInsertOperationInternal, PointStructPersisted, UpdateMode, VectorStructPersisted,
     };
 
     use super::*;
     use crate::RetrieveRequestBuilder;
-    use crate::read_only::tests::{assert_follower_vectors, point};
+    use crate::read_only::ReadOnlyEdgeShard;
+    use crate::read_only::tests::{VECTOR_NAME, assert_follower_vectors, point};
     use crate::read_view::EdgeShardRead as _;
 
     /// The leader writes its payload storage in mutable (Gridstore) mode, which an
@@ -327,6 +330,95 @@ mod store {
             Some(point(50).vector.try_into().unwrap())
         );
         assert_eq!(results[1].payload, Some(payload_json! { "kind": "fresh" }),);
+    }
+
+    /// A point moved out of an immutable segment loses its old copy while
+    /// the write target is below the deferred-points threshold, and keeps it
+    /// once the target is past it: the new copy is deferred, so a reader
+    /// hiding deferred points still serves the old one.
+    #[test]
+    fn store_past_deferred_threshold_keeps_the_old_copy() {
+        use std::sync::atomic::AtomicBool;
+
+        use segment::data_types::load_profile::LoadProfile;
+
+        use crate::read_only::LocalSegmentEnumerator;
+
+        let dir = vacuumed_leader("edge-update-store-deferred");
+        recreate_payload_storages_append_only(dir.path());
+
+        // 1 KB of 1-dim f32 vectors: slots from 256 on are deferred.
+        let threshold_kb = 1;
+        let writer = UpdateOnlyEdgeShard::open(
+            MmapFs,
+            dir.path(),
+            LocalSegmentEnumerator::new(dir.path()),
+            Some(threshold_kb),
+        )
+        .unwrap();
+
+        let moved = PointStructPersisted {
+            vector: point(7).vector,
+            ..point(501)
+        };
+        let (writer, outcome) = writer.apply_batch(store_batch(2000, vec![moved])).unwrap();
+        let record = &outcome.points[0];
+        assert_eq!(record.tombstoned.len(), 1, "below the cutoff, moves retire");
+        assert!(record.shadowed.is_empty());
+
+        let filler = (2001..=2256).map(point).collect();
+        let (writer, _) = writer.apply_batch(store_batch(2001, filler)).unwrap();
+
+        let rewritten = PointStructPersisted {
+            vector: point(7).vector,
+            ..point(500)
+        };
+        let (_writer, outcome) = writer
+            .apply_batch(store_batch(2002, vec![rewritten]))
+            .unwrap();
+        let record = &outcome.points[0];
+        assert_eq!(record.kind, PointApplyKind::Stored);
+        assert!(record.tombstoned.is_empty());
+        assert_eq!(record.superseded, None);
+        assert_eq!(
+            record.shadowed.len(),
+            1,
+            "past the cutoff, the old copy stays"
+        );
+
+        let retrieve_500 = |follower: &ReadOnlyEdgeShard<MmapFile>| {
+            let results = follower
+                .retrieve(
+                    RetrieveRequestBuilder::new(vec![ExtendedPointId::NumId(500)])
+                        .with_vector(WithVector::Bool(true))
+                        .build(),
+                )
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            results[0].vector.clone()
+        };
+
+        // Showing every point, the newest copy wins.
+        let follower = open_follower(dir.path());
+        assert_eq!(
+            retrieve_500(&follower),
+            Some(point(7).vector.try_into().unwrap()),
+        );
+
+        // Hiding deferred points, the kept copy still serves.
+        let follower = ReadOnlyEdgeShard::<MmapFile>::open_with_enumerator(
+            MmapFs,
+            dir.path(),
+            LocalSegmentEnumerator::new(dir.path()),
+            None,
+            Some(LoadProfile::for_retrieve().with_deferred_points_threshold_kb(Some(threshold_kb))),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            retrieve_500(&follower),
+            Some(point(500).vector.try_into().unwrap()),
+        );
     }
 
     /// A retried store batch is a no-op — through the same writer and through
@@ -561,6 +653,85 @@ mod store {
             Some(payload_json! { "kind": "updated" })
         );
     }
+
+    /// The writer appends through its own path, which has to normalize cosine
+    /// vectors just as the classic one does.
+    #[test]
+    fn appended_cosine_vectors_are_normalized() {
+        // [3, 4] has length 5, so a normalizing store holds [0.6, 0.8].
+        const RAW: [f32; 2] = [3.0, 4.0];
+        const UNIT: [f32; 2] = [0.6, 0.8];
+
+        let dir = cosine_leader("edge-update-cosine");
+        recreate_payload_storages_append_only(dir.path());
+
+        let writer = UpdateOnlyEdgeShard::<MmapFs>::open_mmap(dir.path()).unwrap();
+        let (_writer, outcome) = writer
+            .apply_batch(store_batch(100, vec![cosine_point(2, RAW)]))
+            .unwrap();
+        assert_eq!(outcome.stored, 1);
+
+        let follower = open_follower(dir.path());
+        // Point 1 went in through the classic path: that is the bar.
+        assert_unit_vector(&follower, 1, UNIT);
+        assert_unit_vector(&follower, 2, UNIT);
+    }
+
+    fn cosine_leader(prefix: &str) -> TempDir {
+        let dir = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
+
+        let mut config = test_config();
+        let params = config.vectors.get_mut(VECTOR_NAME).unwrap();
+        params.size = 2;
+        params.distance = Distance::Cosine;
+
+        let leader = EdgeShard::new(dir.path(), config).unwrap();
+        leader
+            .update(PointOperation(UpsertPoints(PointsList(vec![
+                cosine_point(1, [3.0, 4.0]),
+            ]))))
+            .unwrap();
+        leader.flush().unwrap();
+
+        dir
+    }
+
+    fn cosine_point(id: u64, vector: [f32; 2]) -> PointStructPersisted {
+        PointStructPersisted {
+            id: ExtendedPointId::NumId(id),
+            vector: VectorStructPersisted::from(VectorStructInternal::Named(HashMap::from([(
+                VECTOR_NAME.to_string(),
+                VectorInternal::from(vector.to_vec()),
+            )]))),
+            payload: None,
+        }
+    }
+
+    fn assert_unit_vector(follower: &ReadOnlyEdgeShard<MmapFile>, id: u64, expected: [f32; 2]) {
+        let results = follower
+            .retrieve(
+                RetrieveRequestBuilder::new(vec![ExtendedPointId::NumId(id)])
+                    .with_payload(WithPayloadInterface::Bool(false))
+                    .with_vector(WithVector::Bool(true))
+                    .build(),
+            )
+            .unwrap();
+        let vector = results[0].vector.as_ref().expect("vector present");
+        let VectorStructInternal::Named(vectors) = vector else {
+            panic!("expected Named vectors, got {vector:?}");
+        };
+        let named = vectors.get(VECTOR_NAME).expect("vector name exists");
+        let VectorInternal::Dense(stored) = named else {
+            panic!("expected Dense vector, got {named:?}");
+        };
+        assert_eq!(stored.len(), expected.len(), "point {id}: {stored:?}");
+        for (got, want) in stored.iter().zip(&expected) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "point {id}: stored {stored:?}, expected the unit vector {expected:?}",
+            );
+        }
+    }
 }
 
 /// A claimed target opens non-writable; a created appendable takes the writes.
@@ -598,6 +769,7 @@ fn optimizing_target_gets_a_created_appendable() {
         MmapFs,
         dir.path(),
         ManifestSegmentEnumerator::new(MmapFs, dir.path()),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -651,6 +823,7 @@ fn empty_manifest_shard_bootstraps_an_appendable() {
         MmapFs,
         dir.path(),
         ManifestSegmentEnumerator::new(MmapFs, dir.path()),
+        None,
     )
     .unwrap();
     assert_eq!(writer.segments_count(), 0);

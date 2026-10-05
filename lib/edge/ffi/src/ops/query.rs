@@ -53,7 +53,7 @@ impl EdgeShard {
 
     /// Executes several queries as one planned batch.
     ///
-    /// Returns one result list per request, in the same order as `requests`.
+    /// Returns one result list per request, in the same order as `request.queries`.
     /// Prefer this over repeated [`EdgeShard::query`] calls when issuing
     /// several independent queries against the same shard: the batch is
     /// planned as a whole, so its searches share one pass over the segments
@@ -65,13 +65,9 @@ impl EdgeShard {
     /// shard is unloaded, or
     /// [`EdgeError::OperationError`](crate::error::EdgeError) if any request
     /// is invalid or a required payload index is missing.
-    pub fn query_batch(&self, requests: Vec<QueryRequest>) -> Result<Vec<Vec<ScoredPoint>>> {
+    pub fn query_batch(&self, request: QueryBatchRequest) -> Result<Vec<Vec<ScoredPoint>>> {
         self.with_shard(|shard| {
-            let requests = requests
-                .into_iter()
-                .map(edge::QueryRequest::try_from)
-                .collect::<Result<Vec<_>, _>>()?;
-            let batches = shard.query_batch(requests)?;
+            let batches = shard.query_batch(request.try_into()?)?;
             Ok(batches
                 .into_iter()
                 .map(|points| points.into_iter().map(ScoredPoint::from).collect())
@@ -691,6 +687,27 @@ fn prefetch_to_edge(p: Prefetch, depth: u32) -> Result<edge::Prefetch, crate::er
     })
 }
 
+/// Queries executed together as one planned batch.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct QueryBatchRequest {
+    /// Queries to execute. Results are returned in the same order.
+    pub queries: Vec<QueryRequest>,
+}
+
+impl TryFrom<QueryBatchRequest> for edge::QueryBatchRequest {
+    type Error = crate::error::EdgeError;
+
+    fn try_from(request: QueryBatchRequest) -> Result<Self, Self::Error> {
+        let QueryBatchRequest { queries } = request;
+        Ok(Self::new(
+            queries
+                .into_iter()
+                .map(edge::QueryRequest::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+}
+
 // ── QueryRequest ────────────────────────────────────────────────────────────
 
 /// The general-purpose query request supporting prefetching, fusion, and
@@ -828,5 +845,7 @@ fn assert_every_scoring_query_is_mapped(q: shard::query::ScoringQuery) {
             // [`Sample::Random`]
             SampleInternal::Random => {}
         },
+        // Not exposed: edge does not run BM25 over a text index yet.
+        shard::query::ScoringQuery::Text(_) => {}
     }
 }

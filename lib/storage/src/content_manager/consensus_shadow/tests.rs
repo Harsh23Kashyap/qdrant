@@ -1,8 +1,8 @@
-//! Running the shadow alongside a stand-in for `TableOfContent`.
+//! Run consensus state machine alongside a stand-in for `TableOfContent`.
 //!
-//! What the shadow decides is asserted on the report [`ShadowStateMachine::diff`] returns.
-//! Driving an entry through `ConsensusManager` only covers the wiring, where the one thing a
-//! test can observe is whether the peer died.
+//! Most tests use `ShadowStateMachine` directly, so they can inspect divergence reports.
+//! Tests using `ConsensusManager` only check that applying a Raft entry runs validation
+//! and panics on a divergence in panic mode.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -23,7 +23,7 @@ use tempfile::{Builder, TempDir};
 use super::*;
 use crate::content_manager::alias_mapping::AliasMapping;
 use crate::content_manager::collection_meta_ops::{
-    CollectionMetaOperations, CreatePayloadIndex, DropPayloadIndex, SetShardReplicaState,
+    CollectionMetaOperations, CreatePayloadIndex, DropPayloadIndex,
 };
 use crate::content_manager::consensus::operation_sender::OperationSender;
 use crate::content_manager::consensus_manager::{ConsensusManager, SnapshotData};
@@ -38,12 +38,12 @@ const COLLECTION: &str = "books";
 const ALIAS: &str = "novels";
 const OTHER_ALIAS: &str = "crime";
 const METADATA_KEY: &str = "owner";
-/// Collection neither side holds
+/// Collection absent from consensus state machine and `Container`
 const MISSING: &str = "outis";
 
-/// Both sides record the same cluster metadata key: the machine in its own state, the apply
-/// path in `Persistent`, which the compare reads back. Needs the manager, since the applied
-/// side is what the handler writes.
+/// Consensus state machine and operation handler should apply the same cluster metadata update.
+/// This test uses `ConsensusManager` because the operation handler writes the applied value to
+/// `Persistent`.
 #[test]
 fn matching_entry() {
     let container = Arc::new(container());
@@ -60,8 +60,33 @@ fn matching_entry() {
         .expect("entry applied");
 }
 
-/// A collection differing inside is a divergence, so the compare reads collection state and not
-/// just the names
+/// `ConsensusManager` should initialize consensus state machine before running operation handler
+#[test]
+fn manager_initializes_state_machine_before_handler() {
+    let container = Arc::new(container());
+    let dir = tempdir();
+    let manager = manager(container.clone(), ShadowMode::Panic, dir.path());
+
+    manager.apply_normal_entry(&entry(&nop())).expect("nop");
+
+    assert_eq!(container.snapshots_before_handler(), 1);
+}
+
+/// `ConsensusManager` should return operation handler's boolean result unchanged
+#[test]
+fn manager_preserves_handler_result() {
+    let mut container = container();
+    container.handler_result = false;
+
+    let container = Arc::new(container);
+    let dir = tempdir();
+    let manager = manager(container, ShadowMode::Disabled, dir.path());
+
+    assert!(!manager.apply_normal_entry(&entry(&nop())).expect("nop"));
+}
+
+/// Consensus state machine and `Container` contain the same collection, but with different shard
+/// state; validation should report the difference
 #[test]
 fn diverged_collection() {
     let shadow = Shadow::new(ShadowMode::Panic);
@@ -76,8 +101,8 @@ fn diverged_collection() {
     );
 }
 
-/// An operation naming an alias has the collection behind it compared, under the name the two
-/// sides hold it by
+/// When an operation names an alias, validation should resolve it to a collection and report
+/// differences under that collection's name
 #[test]
 fn diverged_collection_under_alias() {
     let shadow = Shadow::new(ShadowMode::Panic);
@@ -92,7 +117,8 @@ fn diverged_collection_under_alias() {
     );
 }
 
-/// Both sides reject a missing collection, and with the same error class
+/// Consensus state machine and operation handler should both reject a missing collection with
+/// the same error class
 #[test]
 fn matching_rejection() {
     let shadow = Shadow::new(ShadowMode::Panic);
@@ -107,8 +133,9 @@ fn matching_rejection() {
     );
 }
 
-/// The machine rejects a missing collection as not-found, the apply path as bad-request. The
-/// class reaches the client, so the two have to agree on it.
+/// Consensus state machine rejects a missing collection as not-found, while operation handler
+/// rejects it as bad-request. Validation should report the difference because the error class
+/// reaches the client.
 #[test]
 fn differing_rejection() {
     let shadow = Shadow::new(ShadowMode::Panic);
@@ -121,8 +148,8 @@ fn differing_rejection() {
     );
 }
 
-/// The machine accepts what the apply path rejected, which no state compare catches: a
-/// rejection leaves the state alone on both sides
+/// Validation should report when consensus state machine accepts an operation rejected by the
+/// operation handler, even though neither state changes
 #[test]
 fn rejected_by_apply_only() {
     let shadow = Shadow::new(ShadowMode::Panic);
@@ -131,31 +158,40 @@ fn rejected_by_apply_only() {
     assert!(shadow.apply_with(&nop(), &rejection).is_some());
 }
 
-/// An operation the machine does not model, naming no collection, can have changed any of them
+/// An uncovered operation that names no collection may have changed any collection,
+/// so validation should invalidate the entire consensus state machine
 #[test]
 fn not_covered_invalidates() {
     invalidates(&remove_peer(), &Ok(true));
 }
 
-/// An operation the machine does not model reads the collections it names back, rather than
-/// rebuilding the machine from every collection
+/// When an uncovered operation names a collection, validation should reload only that collection
+/// instead of rebuilding the entire consensus state machine
 #[test]
 fn not_covered_resync() {
     let shadow = Shadow::new(ShadowMode::Panic);
 
-    // Builds the machine, the one full read of the state this test expects
+    // Initialization reads all collections; resync below should only read the named collection
     assert_eq!(shadow.apply(&nop()), None);
 
+    // Add shard directly to `Container`, so its collection state no longer matches state machine
     shadow.container.add_shard(0);
-    assert_eq!(shadow.apply(&set_replica_state()), None);
 
-    // Names the collection, so its state is compared: the shard has to be in both by now
+    // Simulate an uncovered operation that names this collection
+    assert_eq!(
+        shadow.diff_as_not_covered(&drop_payload_index(COLLECTION)),
+        None
+    );
+
+    // `drop_payload_index` makes `apply` compare collection states, which should match after resync
     assert_eq!(shadow.apply(&drop_payload_index(COLLECTION)), None);
 
+    // Full collection state should have been read only once during initialization;
+    // resync should have read only the named collection
     assert_eq!(shadow.container.snapshots(), 1);
 }
 
-/// Reading one collection back does not paper over a divergence somewhere else
+/// Resyncing one collection should not hide a divergence in unrelated state
 #[test]
 fn not_covered_keeps_the_rest() {
     let shadow = Shadow::new(ShadowMode::Panic);
@@ -163,13 +199,17 @@ fn not_covered_keeps_the_rest() {
     assert_eq!(shadow.apply(&nop()), None);
 
     shadow.container.add_alias(OTHER_ALIAS);
-    assert_eq!(shadow.apply(&set_replica_state()), None);
+    assert_eq!(
+        shadow.diff_as_not_covered(&drop_payload_index(COLLECTION)),
+        None
+    );
 
     assert_eq!(shadow.apply(&nop()).as_deref(), Some("aliases"));
 }
 
-/// Recovering a partial shard snapshot rewrites the payload index schema of a collection
-/// without a consensus operation. The collection is read back, rather than reported.
+/// Partial snapshot recovery can rewrite collection payload index schema without a consensus
+/// operation. Consensus state machine reloads affected collection instead of reporting recovered
+/// state as a divergence.
 #[test]
 fn dirty_collection_resync() {
     let shadow = Shadow::new(ShadowMode::Panic);
@@ -179,12 +219,12 @@ fn dirty_collection_resync() {
     shadow.container.add_shard(0);
     shadow.container.mark_dirty();
 
-    // Names the collection, so its state is compared
+    // The operation names the collection, so validation should read its state after resync
     assert_eq!(shadow.apply(&drop_payload_index(COLLECTION)), None);
 }
 
-/// Recovery runs next to the apply, so a collection can be dirtied after the machine planned
-/// the entry and before the compare reads it back
+/// Partial snapshot recovery can finish after consensus state machine applies an operation but
+/// before validation compares state. A second resync should load recovered collection state.
 #[test]
 fn dirty_collection_resync_mid_apply() {
     let shadow = Shadow::new(ShadowMode::Panic);
@@ -199,8 +239,8 @@ fn dirty_collection_resync_mid_apply() {
     assert_eq!(report, None);
 }
 
-/// A service error kills the consensus thread, and what the failed apply wrote before it gave
-/// up is not something the machine predicts
+/// A service error may leave the operation handler's writes partially applied,
+/// so consensus state machine should be invalidated
 #[test]
 fn service_error_invalidates() {
     let failed = Err(StorageError::service_error("out of disk"));
@@ -208,10 +248,10 @@ fn service_error_invalidates() {
     invalidates(&nop(), &failed);
 }
 
-/// An entry the machine cannot be compared against drops the machine, so the next one builds
-/// a machine out of what the apply path holds.
+/// Verify that validation invalidates consensus state machine when it cannot compare an operation.
 ///
-/// The alias makes the two disagree, so a machine that survived the entry reports it.
+/// Alias added directly to `Container` would be reported as a divergence if state machine is not
+/// invalidated.
 fn invalidates(operation: &ConsensusOperations, result: &StorageResult<bool>) {
     let shadow = Shadow::new(ShadowMode::Panic);
 
@@ -223,17 +263,18 @@ fn invalidates(operation: &ConsensusOperations, result: &StorageResult<bool>) {
     assert_eq!(shadow.apply(&nop()), None);
 }
 
-/// Snapshot recovery leaves state no operation asked for, so the machine goes and the next
-/// entry builds a new one. Here the snapshot empties the container while the machine still
-/// holds a collection and its alias.
+/// Snapshot recovery replaces applied state without updating consensus state machine,
+/// so next Raft entry should rebuild it
 #[test]
 fn snapshot_invalidates() {
     let container = Arc::new(container());
+
     let dir = tempdir();
     let manager = manager(container, ShadowMode::Panic, dir.path());
 
     manager.apply_normal_entry(&entry(&nop())).expect("nop");
 
+    // Snapshot removes the existing collection and its alias
     manager
         .apply_snapshot(&snapshot())
         .expect("snapshot applied")
@@ -242,7 +283,8 @@ fn snapshot_invalidates() {
     manager.apply_normal_entry(&entry(&nop())).expect("nop");
 }
 
-/// The peer dies on a divergence in panic mode, which is what the consensus test suite runs
+/// `ConsensusManager` should panic on a divergence when consensus state machine validation runs
+/// in panic mode
 #[test]
 #[should_panic(expected = "aliases")]
 fn manager_panics_on_divergence() {
@@ -257,7 +299,8 @@ fn manager_panics_on_divergence() {
     manager.apply_normal_entry(&entry(&nop())).expect("nop");
 }
 
-/// Same divergence with the shadow off, so a shadow that runs anyway fails this
+/// With consensus state machine validation disabled, `ConsensusManager` should not panic on
+/// the same divergence
 #[test]
 fn manager_disabled() {
     let container = Arc::new(container());
@@ -272,12 +315,12 @@ fn manager_disabled() {
 }
 
 #[test]
-fn scrape_cluster_state() {
+fn read_cluster_state() {
     let dir = tempdir();
     let persistent = persistent(dir.path());
     let container = container();
 
-    let state = super::scrape_cluster_state(&container, &persistent);
+    let state = super::read_cluster_state(&container, &persistent);
 
     assert_eq!(state.collections, *container.collections.lock());
     assert_eq!(state.aliases, *container.aliases.lock());
@@ -293,14 +336,15 @@ fn scrape_cluster_state() {
     assert_eq!(state.cluster_metadata, persistent.cluster_metadata);
 }
 
-/// The per-entry read holds the same state, with collection names in place of their state
+/// `read_shallow_state` should return applied state with collection names instead of full
+/// collection state; all other fields should match `read_cluster_state`
 #[test]
-fn scrape_actual_state() {
+fn read_shallow_state() {
     let dir = tempdir();
     let persistent = persistent(dir.path());
     let container = container();
 
-    let state = super::scrape_actual_state(&container, &persistent);
+    let state = super::read_shallow_state(&container, &persistent);
 
     assert_eq!(state.collections, BTreeSet::from([COLLECTION.to_string()]));
     assert_eq!(state.aliases, *container.aliases.lock());
@@ -316,7 +360,8 @@ fn scrape_actual_state() {
     assert_eq!(state.cluster_metadata, persistent.cluster_metadata);
 }
 
-/// Shadow over a container, without the manager in between
+/// Test wrapper that applies operations to `ShadowStateMachine` and compares its state with
+/// `Container` directly, without `ConsensusManager`
 struct Shadow {
     machine: Mutex<ShadowStateMachine>,
     container: Container,
@@ -330,19 +375,30 @@ impl Shadow {
         let dir = tempdir();
 
         Self {
-            machine: mode.build().expect("shadow enabled"),
+            machine: mode.build().expect("state machine enabled"),
             container: container(),
             persistent: persistent(dir.path()),
             _dir: dir,
         }
     }
 
-    /// Plan `operation` and compare, as an entry the apply path answered `Ok` to
+    /// Apply `operation` and compare as if the operation handler returned `Ok`
     fn apply(&self, operation: &ConsensusOperations) -> Option<String> {
         self.apply_with(operation, &Ok(true))
     }
 
-    /// Plan `operation` and compare, as an entry the apply path answered `result` to
+    /// Test the resync path independently of which collection operations are implemented
+    fn diff_as_not_covered(&self, operation: &ConsensusOperations) -> Option<String> {
+        self.machine.lock().diff(
+            &self.container,
+            &self.persistent,
+            operation,
+            &ApplyOutcome::NotCovered,
+            &Ok(true),
+        )
+    }
+
+    /// Apply `operation` and compare with the operation handler's `result`
     fn apply_with(
         &self,
         operation: &ConsensusOperations,
@@ -351,8 +407,8 @@ impl Shadow {
         self.apply_between(operation, result, |_| ())
     }
 
-    /// Plan `operation`, let `between` change the container the way something running next to
-    /// the apply would, then compare
+    /// Apply `operation`, let `between` simulate a concurrent change to `Container`,
+    /// then compare with the operation handler's `result`
     fn apply_between(
         &self,
         operation: &ConsensusOperations,
@@ -378,7 +434,8 @@ fn tempdir() -> TempDir {
     Builder::new().prefix("shadow").tempdir().expect("temp dir")
 }
 
-/// Manager over `container`, applying entries with the shadow running in `mode`
+/// Build `ConsensusManager` with the test `Container` and consensus state machine validation
+/// running in `mode`
 fn manager(
     container: Arc<Container>,
     mode: ShadowMode,
@@ -432,7 +489,8 @@ fn nop() -> ConsensusOperations {
     ConsensusOperations::CollectionMeta(Box::new(CollectionMetaOperations::Nop { token: 0 }))
 }
 
-/// Covered operation naming `collection`, for a collection no side holds
+/// Covered operation that names `collection`, which is absent from the consensus state machine
+/// and `Container`
 fn create_payload_index(collection: &str) -> ConsensusOperations {
     let operation = CreatePayloadIndex {
         collection_name: collection.to_string(),
@@ -445,7 +503,7 @@ fn create_payload_index(collection: &str) -> ConsensusOperations {
     )))
 }
 
-/// Covered operation naming `collection`, so the compare after it reads that collection
+/// Covered operation that names `collection`, causing validation to compare that collection
 fn drop_payload_index(collection: &str) -> ConsensusOperations {
     let operation = DropPayloadIndex {
         collection_name: collection.to_string(),
@@ -457,27 +515,12 @@ fn drop_payload_index(collection: &str) -> ConsensusOperations {
     )))
 }
 
-/// Operation the machine does not model, and which names no collection
+/// Operation not covered by the consensus state machine that names no collection
 fn remove_peer() -> ConsensusOperations {
     ConsensusOperations::RemovePeer(PEER_ID)
 }
 
-/// Operation the machine does not model yet, naming the collection it changes
-fn set_replica_state() -> ConsensusOperations {
-    let operation = SetShardReplicaState {
-        collection_name: COLLECTION.to_string(),
-        shard_id: 0,
-        peer_id: PEER_ID,
-        state: ReplicaState::Active,
-        from_state: None,
-    };
-
-    ConsensusOperations::CollectionMeta(Box::new(CollectionMetaOperations::SetShardReplicaState(
-        operation,
-    )))
-}
-
-/// Peer state holding this peer's address and metadata, and one cluster metadata key
+/// `Persistent` state containing this peer's address and metadata plus one cluster metadata key
 fn persistent(path: &Path) -> Persistent {
     let mut persistent =
         Persistent::load_or_init(path, true, false, Some(PEER_ID)).expect("state initialized");
@@ -494,7 +537,7 @@ fn persistent(path: &Path) -> Persistent {
     persistent
 }
 
-/// Container holding one collection under one alias, and a quota config away from its default
+/// `Container` with one collection, one alias, and non-default quota config
 fn container() -> Container {
     let mut aliases = AliasMapping::default();
     aliases.insert(ALIAS.to_string(), COLLECTION.to_string());
@@ -509,22 +552,26 @@ fn container() -> Container {
             enabled: true,
             ..Default::default()
         },
+        handler_result: true,
         snapshots: AtomicUsize::new(0),
+        snapshots_before_handler: AtomicUsize::new(0),
         dirty_collections: Mutex::new(BTreeSet::new()),
     }
 }
 
-/// `TableOfContent` stand-in answering out of the state a test gives it.
+/// Test `TableOfContent` stand-in backed by state configured for each test.
 ///
-/// The state is behind locks, so a test can change it the way something other than the entry
-/// being applied would.
+/// Locks let tests mutate state as if another task changed it while a Raft entry was applied.
 struct Container {
     collections: Mutex<HashMap<CollectionId, collection_state::State>>,
     aliases: Mutex<AliasMapping>,
     quota_config: QuotaConfig,
-    /// How many times the whole state was read back, to tell a resync from a rebuild
+    handler_result: bool,
+    /// Number of full collection-state reads, used to distinguish resync from rebuild
     snapshots: AtomicUsize,
-    /// Collections changed without a consensus operation asking for it
+    /// Number of full collection-state reads observed when operation handler ran
+    snapshots_before_handler: AtomicUsize,
+    /// Collections changed outside consensus and waiting to be resynced
     dirty_collections: Mutex<BTreeSet<CollectionId>>,
 }
 
@@ -533,20 +580,23 @@ impl Container {
         self.snapshots.load(Ordering::Relaxed)
     }
 
-    /// Record that the collection changed without a consensus operation, as recovering a
-    /// partial shard snapshot does
+    fn snapshots_before_handler(&self) -> usize {
+        self.snapshots_before_handler.load(Ordering::Relaxed)
+    }
+
+    /// Mark collection as changed outside consensus, as partial snapshot recovery does
     fn mark_dirty(&self) {
         self.dirty_collections.lock().insert(COLLECTION.to_string());
     }
 
-    /// Point another alias at the collection, as an operation the machine never saw would
+    /// Add alias to `Container` without updating consensus state machine
     fn add_alias(&self, alias: &str) {
         self.aliases
             .lock()
             .insert(alias.to_string(), COLLECTION.to_string());
     }
 
-    /// Add a shard to the collection, as an operation the machine does not model would
+    /// Add shard to `Container` without updating consensus state machine
     fn add_shard(&self, shard_id: ShardId) {
         let replicas = HashMap::from([(PEER_ID, ReplicaState::Active)]);
 
@@ -560,6 +610,13 @@ impl Container {
 }
 
 impl CollectionContainer for Container {
+    fn apply_action(
+        &self,
+        _action: crate::content_manager::consensus_state_machine::Action,
+    ) -> Result<(), StorageError> {
+        unimplemented!()
+    }
+
     fn collections_snapshot(&self) -> CollectionsSnapshot {
         self.snapshots.fetch_add(1, Ordering::Relaxed);
 
@@ -593,13 +650,17 @@ impl CollectionContainer for Container {
         self.quota_config
     }
 
-    /// Answers and changes nothing: every test applies an operation whose effect on the
-    /// container a test writes by hand, or none at all
+    /// `ConsensusManager` calls this method for collection meta operations.
+    /// Manager tests only pass `Nop` here; other tests mutate `Container` directly,
+    /// so this stand-in can return success without applying the operation.
     fn perform_collection_meta_op(
         &self,
         _operation: CollectionMetaOperations,
     ) -> Result<bool, StorageError> {
-        Ok(true)
+        self.snapshots_before_handler
+            .store(self.snapshots(), Ordering::Relaxed);
+
+        Ok(self.handler_result)
     }
 
     fn apply_collections_snapshot(&self, data: CollectionsSnapshot) -> Result<(), StorageError> {
@@ -614,7 +675,7 @@ impl CollectionContainer for Container {
         Ok(())
     }
 
-    // Never reached: no test removes a peer or writes a quota config
+    // Remaining `CollectionContainer` methods are not exercised by these tests
 
     fn remove_peer(&self, _peer_id: PeerId) -> Result<(), StorageError> {
         unimplemented!()

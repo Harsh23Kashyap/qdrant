@@ -12,7 +12,7 @@ use atomic_refcell::AtomicRefCell;
 use bitvec::macros::internal::funty::Integral;
 use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::flags::feature_flags;
+use common::flags::FeatureFlags;
 use common::progress_tracker::ProgressTracker;
 use common::small_uint::U24;
 use common::storage_version::StorageVersion;
@@ -50,12 +50,12 @@ use crate::segment_constructor::{
 };
 use crate::types::{
     CompactExtendedPointId, ExtendedPointId, HnswGlobalConfig, Memory, PayloadFieldSchema,
-    PayloadKeyType, SegmentConfig, SegmentState, SeqNumberType, VectorNameBuf,
+    PayloadKeyType, SegmentConfig, SegmentState, SeqNumberType, VectorNameBuf, VectorStorageType,
 };
 use crate::vector_storage::quantized::quantized_vectors::{
     QuantizedVectors, QuantizedVectorsStorageType,
 };
-use crate::vector_storage::{VectorStorage, VectorStorageEnum, VectorStorageRead};
+use crate::vector_storage::{VectorStorage, VectorStorageEnum, VectorStorageRead, graph_inline};
 
 /// Structure for constructing segment out of several other segments
 pub struct SegmentBuilder {
@@ -65,6 +65,7 @@ pub struct SegmentBuilder {
     vector_data: HashMap<VectorNameBuf, VectorData>,
     segment_config: SegmentConfig,
     hnsw_global_config: HnswGlobalConfig,
+    feature_flags: FeatureFlags,
 
     // The temporary segment directory
     temp_dir: TempDir,
@@ -91,6 +92,7 @@ impl SegmentBuilder {
         temp_dir: &Path,
         segment_config: &SegmentConfig,
         hnsw_global_config: &HnswGlobalConfig,
+        feature_flags: FeatureFlags,
     ) -> OperationResult<Self> {
         let temp_dir = create_temp_dir(temp_dir)?;
 
@@ -102,7 +104,10 @@ impl SegmentBuilder {
             IdTrackerEnum::InMemoryIdTracker(InMemoryIdTracker::new())
         };
 
-        let payload_storage = create_payload_storage(temp_dir.path(), segment_config)?;
+        // A segment being built is thrown away on a crash, and durably flushed before it is
+        // loaded, so its storages don't need a journal to repair torn writes
+        let mut payload_storage = create_payload_storage(temp_dir.path(), segment_config)?;
+        payload_storage.disable_journal();
 
         let mut vector_data = HashMap::new();
 
@@ -124,10 +129,13 @@ impl SegmentBuilder {
         for (vector_name, sparse_vector_config) in &segment_config.sparse_vector_data {
             let vector_storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
 
-            let vector_storage = create_sparse_vector_storage(
+            let mut vector_storage = create_sparse_vector_storage(
                 &vector_storage_path,
                 &sparse_vector_config.storage_type,
             )?;
+            if let VectorStorageEnum::SparseMmap(storage) = &mut vector_storage {
+                storage.disable_journal();
+            }
 
             vector_data.insert(
                 vector_name.to_owned(),
@@ -145,6 +153,7 @@ impl SegmentBuilder {
             vector_data,
             segment_config: segment_config.clone(),
             hnsw_global_config: hnsw_global_config.clone(),
+            feature_flags,
             temp_dir,
             indexed_fields: Default::default(),
             defragment_keys: vec![],
@@ -536,6 +545,7 @@ impl SegmentBuilder {
             segments_path,
             Uuid::new_v4(),
             None,
+            true,
             ResourcePermit::dummy(get_num_indexing_threads(0) as u32),
             &AtomicBool::new(false),
             &mut rand::rng(),
@@ -545,12 +555,18 @@ impl SegmentBuilder {
         .unwrap()
     }
 
+    /// Build the segment.
+    ///
+    /// If `ready` is false, the version will not be stored, so the segment is skipped on
+    /// restart. The caller is then responsible for saving the version manually, once it is
+    /// safe to do so, to make the segment ready.
     #[allow(clippy::too_many_arguments)]
     pub fn build<R: Rng + ?Sized>(
         self,
         segments_path: &Path,
         segment_uuid: Uuid,
         deferred_internal_id: Option<PointOffsetType>,
+        ready: bool,
         permit: ResourcePermit,
         stopped: &AtomicBool,
         rng: &mut R,
@@ -563,8 +579,9 @@ impl SegmentBuilder {
                 id_tracker,
                 payload_storage,
                 mut vector_data,
-                segment_config,
+                mut segment_config,
                 hnsw_global_config,
+                feature_flags,
                 temp_dir,
                 indexed_fields,
                 defragment_keys: _,
@@ -585,7 +602,11 @@ impl SegmentBuilder {
             let progress_sparse_vector_index = progress_segment.subtask("sparse_vector_index");
 
             let appendable_flag = segment_config.is_appendable();
-
+            // A non-appendable segment is complete once built, its payloads are only read. Before
+            // the flush, which persists the layout
+            if !appendable_flag && feature_flags.compact_logstore_tracker {
+                payload_storage.make_immutable()?;
+            }
             payload_storage.flusher()()?;
             let payload_storage_arc = Arc::new(AtomicRefCell::new(payload_storage));
 
@@ -654,7 +675,7 @@ impl SegmentBuilder {
 
                 let vector_storage_arc = Arc::new(AtomicRefCell::new(vector_info.vector_storage));
 
-                old_indices.insert(vector_name, vector_info.old_indices);
+                old_indices.insert(vector_name.to_owned(), vector_info.old_indices);
 
                 vector_storages_arc.insert(vector_name.to_owned(), vector_storage_arc);
             }
@@ -685,6 +706,8 @@ impl SegmentBuilder {
                 StorageType::from_appendable(appendable_flag),
                 IndexLoadMode::CreateIfMissing,
             )?;
+            // Like the storages, the field indices of a segment being built need no journal
+            payload_index.disable_journal();
             for (field, payload_schema, progress) in indexed_fields {
                 progress.start();
                 payload_index.set_indexed(&field, payload_schema, hw_counter)?;
@@ -712,7 +735,8 @@ impl SegmentBuilder {
             check_process_stopped(stopped)?;
 
             progress_vector_index.start();
-            for (vector_name, vector_config) in &segment_config.vector_data {
+            for (vector_name, vector_config) in segment_config.vector_data.iter_mut() {
+                let vector_storage_path = get_vector_storage_path(temp_dir.path(), vector_name);
                 let vector_storage = vector_storages_arc.remove(vector_name).unwrap();
                 let quantized_vectors =
                     Arc::new(AtomicRefCell::new(quantized_vectors.remove(vector_name)));
@@ -733,7 +757,8 @@ impl SegmentBuilder {
                         stopped,
                         rng,
                         hnsw_global_config: &hnsw_global_config,
-                        feature_flags: feature_flags(),
+                        feature_flags,
+                        inline_vectors: vector_config.inline_vectors_in_graph(),
                         progress: progress_vector_index.running_subtask(vector_name),
                     },
                 )?;
@@ -751,6 +776,24 @@ impl SegmentBuilder {
                 // Index if always loaded on-disk=true from build function
                 // So we may clear unconditionally
                 index.clear_cache()?;
+
+                if feature_flags.combined_vector_storage && vector_config.inline_vectors_in_graph()
+                {
+                    // Reclaim the build storage from its other holders and
+                    // become the sole owner of it.
+                    drop(index);
+                    payload_index_arc
+                        .borrow_mut()
+                        .unregister_vector_storage(vector_name);
+                    let vector_storage = Arc::into_inner(vector_storage)
+                        .map(AtomicRefCell::into_inner)
+                        .ok_or(OperationError::service_error(
+                            "failed to reclaim vector storage for graph-inline finalization",
+                        ))?;
+
+                    graph_inline::finalize(&vector_storage_path, vector_storage)?;
+                    vector_config.storage_type = VectorStorageType::GraphInline;
+                }
             }
             drop(progress_vector_index);
 
@@ -817,8 +860,10 @@ impl SegmentBuilder {
                 temp_dir.path(),
             )?;
 
-            // After version is saved, segment can be loaded on restart
-            SegmentVersion::save(temp_dir.path())?;
+            // Postpone until ready: this segment may still be missing pending proxy changes
+            if ready {
+                SegmentVersion::save(temp_dir.path())?;
+            }
             // All temp data is evicted from RAM
             temp_dir
         };
@@ -833,6 +878,7 @@ impl SegmentBuilder {
             segment_uuid,
             deferred_internal_id,
             stopped,
+            true, // ignore_missing_version: reloaded here before the version save above, if postponed
         )
     }
 

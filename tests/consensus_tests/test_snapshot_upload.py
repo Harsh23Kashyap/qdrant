@@ -124,6 +124,13 @@ def recover_from_uploaded_snapshot(tmp_path: pathlib.Path, n_replicas):
             continue
         break
 
+    # The collection shows up as soon as its creation entry is applied, while
+    # the new peer may still be replaying the rest of the consensus log, in
+    # particular the removal of the killed peer. Snapshot recovery decides which
+    # other replicas to remove or mark dead from the local view of the cluster,
+    # so it must not start before the new peer has caught up.
+    wait_for_same_applied_commit(peer_api_uris[:-1] + [new_url])
+
     # Recover snapshot
     # All nodes share the same snapshot directory, so it is fine to use any
 
@@ -162,6 +169,13 @@ def recover_from_uploaded_snapshot(tmp_path: pathlib.Path, n_replicas):
     # collection through its own local shards plus the remote shards. Asserting
     # a fixed remote count assumes a perfectly balanced placement, which is not
     # guaranteed and makes this test flaky.
+    #
+    # Wait until peer 0's cluster view has settled: the new peer's local shards
+    # can already be Active while remotes on peer 0 are still Partial (esp. with
+    # RF>1 after kill + recover), and a one-shot Active assert races that window.
+    wait_for_collection_shard_transfers_count(peer_api_uris[0], COLLECTION_NAME, 0)
+    wait_for_all_replicas_active(peer_api_uris[0], COLLECTION_NAME)
+
     # Fetch the cluster info once so local and remote shards come from the same
     # cluster revision (two separate requests could observe placement changing
     # between them and reintroduce flakiness).

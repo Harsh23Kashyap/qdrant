@@ -7,7 +7,7 @@ use collection::shards::shard::PeerId;
 use self::alias_mapping::AliasMapping;
 use self::collection_meta_ops::CollectionMetaOperations;
 use self::consensus_manager::CollectionsSnapshot;
-use self::consensus_state_machine::NodeContext;
+use self::consensus_state_machine::{Action, NodeContext};
 use self::errors::StorageError;
 use crate::quota::QuotaConfig;
 
@@ -210,27 +210,15 @@ pub mod consensus_ops {
 /// Collection container abstraction for consensus
 /// Used to mock ToC in consensus state tests
 pub trait CollectionContainer {
+    /// Apply one collection action produced by the consensus state machine
+    fn apply_action(&self, action: Action) -> Result<(), StorageError>;
+
     fn perform_collection_meta_op(
         &self,
         operation: CollectionMetaOperations,
     ) -> Result<bool, StorageError>;
 
     fn collections_snapshot(&self) -> CollectionsSnapshot;
-
-    /// State of one collection, `None` when there is no such collection
-    fn collection_state(&self, collection: &str) -> Option<collection_state::State>;
-
-    /// Names of all collections, without reading their state
-    fn collection_names(&self) -> BTreeSet<CollectionId>;
-
-    /// Current alias mapping
-    fn alias_mapping(&self) -> AliasMapping;
-
-    /// Node-local values operations read, from this node's storage config
-    fn node_context(&self) -> NodeContext;
-
-    /// Collections that changed without a consensus operation asking for it, clearing the record
-    fn take_dirty_collections(&self) -> BTreeSet<CollectionId>;
 
     fn apply_collections_snapshot(&self, data: CollectionsSnapshot) -> Result<(), StorageError>;
 
@@ -244,6 +232,12 @@ pub trait CollectionContainer {
     fn quota_config(&self) -> QuotaConfig;
 
     fn set_quota_config(&self, config: QuotaConfig) -> Result<(), StorageError>;
+
+    fn node_context(&self) -> NodeContext;
+    fn collection_names(&self) -> BTreeSet<CollectionId>;
+    fn alias_mapping(&self) -> AliasMapping;
+    fn collection_state(&self, collection: &str) -> Option<collection_state::State>;
+    fn take_dirty_collections(&self) -> BTreeSet<CollectionId>;
 }
 
 #[cfg(test)]

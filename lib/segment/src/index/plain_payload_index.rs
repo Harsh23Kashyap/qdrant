@@ -9,7 +9,7 @@ use common::condition_checker::{CheckItem, ConditionChecker, Rest, Select, defau
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::generic_consts::AccessPattern;
 use common::iterator_ext::IteratorExt;
-use common::types::{DeferredBehavior, PointOffsetType, ScoreType};
+use common::types::{DeferredBehavior, PointOffsetType, ScoreType, ScoredPointOffset};
 use fs_err as fs;
 use schemars::_serde_json::Value;
 
@@ -17,9 +17,11 @@ use super::field_index::FieldIndex;
 use super::payload_config::PayloadFieldSchemaWithIndexType;
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
+use crate::data_types::query_context::{TextFieldStats, TextQueryContext};
 use crate::id_tracker::{IdTrackerEnum, IdTrackerRead};
 use crate::index::condition_checker::ConditionCheckerEnum;
 use crate::index::field_index::facet_index::FacetIndexEnum;
+use crate::index::field_index::full_text_index::Bm25Params;
 use crate::index::field_index::numeric_index::{NumericFieldIndex, NumericFieldIndexRead};
 use crate::index::field_index::{CardinalityEstimation, FacetIndex, PayloadBlockCondition};
 use crate::index::payload_config::PayloadConfig;
@@ -195,6 +197,30 @@ impl PayloadIndexRead for PlainPayloadIndex {
     fn facet_index_for(&self, _key: &JsonPath) -> Option<impl FacetIndex + '_> {
         // Plain index has no field indexes; the type tag is just a placeholder.
         None::<FacetIndexEnum<'_>>
+    }
+
+    fn fill_text_statistics(
+        &self,
+        _field: PayloadKeyTypeRef,
+        _stats: &mut TextFieldStats,
+        _is_stopped: &AtomicBool,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        // Plain index has no field indexes, so no text statistics either.
+        Ok(())
+    }
+
+    fn score_bm25(
+        &self,
+        _field: PayloadKeyTypeRef,
+        _terms: &[String],
+        _context: &TextQueryContext<'_>,
+        _params: Bm25Params,
+        _accept: &dyn Fn(PointOffsetType) -> bool,
+        _limit: usize,
+    ) -> OperationResult<Vec<ScoredPointOffset>> {
+        // Plain index has no text index to score with.
+        Ok(Vec::new())
     }
 
     fn get_telemetry_data(&self) -> OperationResult<Vec<PayloadIndexTelemetry>> {

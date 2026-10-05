@@ -1,12 +1,10 @@
-//! Common test fixtures.
-//!
-//! `consensus_shadow` builds collection states out of these too, so the two sides of a compare
-//! are the same shape.
+//! Fixtures shared by state-machine and validation tests
 
 mod context;
 mod ops;
 mod prop;
 mod replay;
+mod state;
 
 use std::num::NonZeroU32;
 
@@ -37,6 +35,7 @@ pub(crate) fn node_context() -> NodeContext {
         max_collections: None,
         wal: Default::default(),
         optimizers: optimizers_config(),
+        optimizers_overwrite: None,
         hnsw_index: Default::default(),
         payload: None,
         on_disk_payload: false,

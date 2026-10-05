@@ -13,6 +13,7 @@ use rayon::iter::{
 };
 
 use super::AppendableIdTrackerState;
+use crate::common::check_named_vectors;
 use crate::common::operation_error::OperationResult;
 use crate::data_types::fully_qualified_point::FullyQualifiedPoint;
 use crate::id_tracker::mutable_id_tracker::update_only::{
@@ -237,15 +238,31 @@ impl<Fs: UniversalAppendFs> AppendableSegment<Fs> {
 
     /// Append `points` to fresh slots in this segment and update the id tracker.
     /// Writes component data in parallel before making points visible by publishing versions.
+    ///
+    /// Returns the slot each point landed in, in the order of `points`.
     pub fn store_points(
         &mut self,
         pool: &ThreadPool,
-        points: &[FullyQualifiedPoint],
+        points: &mut [FullyQualifiedPoint],
         hw_counter: &HardwareCounterCell,
-    ) -> OperationResult<()> {
+    ) -> OperationResult<Vec<PointOffsetType>> {
         if points.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+
+        // Cosine scores with a plain dot product, so a stored vector has to be
+        // unit length. `stored_vectors` are storage-native bytes, preprocessed
+        // on their way in already.
+        for point in points.iter_mut() {
+            check_named_vectors(&point.updated_vectors, &self.config)?;
+            point.updated_vectors.preprocess(|name| {
+                self.config
+                    .vector_data
+                    .get(name)
+                    .expect("name checked above")
+            });
+        }
+        let points = &*points;
 
         // Ensure fresh new view of the files
         self.fs.cache_file_info()?;
@@ -316,7 +333,7 @@ impl<Fs: UniversalAppendFs> AppendableSegment<Fs> {
             .set_internal_versions(&self.fs, &slots, &versions)?;
 
         self.fs.rotate_cache_file_info();
-        Ok(())
+        Ok(slots)
     }
 
     /// Retire the given points, addressed by their external ids — the slots

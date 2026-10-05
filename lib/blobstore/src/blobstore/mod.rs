@@ -13,8 +13,8 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use common::counter::referenced_counter::HwMetricRefCounter;
 use common::generic_consts::AccessPattern;
 use common::universal_io::{
-    MmapFile, Populate, UniversalAppend, UniversalReadFileOps, UniversalWrite,
-    UniversalWriteFileOps, UserData,
+    MmapFile, Populate, UniversalAppend, UniversalReadFs, UniversalWrite, UniversalWriteFs,
+    UserData,
 };
 use gridstore::Gridstore;
 pub use logstore::Logstore;
@@ -207,6 +207,34 @@ where
         }
     }
 
+    /// Switch to a layout for a storage that is complete and only read from now on, such as one
+    /// of a segment the optimizer built. The next flush persists the new layout; until then the
+    /// storage on disk cannot be opened, so this suits a storage being built.
+    ///
+    /// In the append-only mode the value mappings are stored compacted: opening reads them into
+    /// RAM whole, so a lookup no longer costs a read. The storage stays writable, but every flush
+    /// then rewrites the whole mapping file. The mutable mode is left as is.
+    pub fn make_immutable(&self) -> Result<()> {
+        match &self.inner {
+            BlobstoreInner::Gridstore(_) => Ok(()),
+            BlobstoreInner::Logstore(storage) => storage.make_immutable(&self.fs),
+        }
+    }
+
+    /// Don't journal the value mappings on flush.
+    ///
+    /// In the mutable mode a flush first journals its mapping writes, so a mapping write a crash
+    /// tears is repaired when opening. Only disable this for a new storage that is thrown away on
+    /// a crash, and is durably flushed before it is used. Such as one of a segment being built.
+    ///
+    /// The append-only mode has no journal, appends cannot tear existing mappings.
+    pub fn disable_journal(&mut self) {
+        match &mut self.inner {
+            BlobstoreInner::Gridstore(storage) => storage.disable_journal(),
+            BlobstoreInner::Logstore(_) => {}
+        }
+    }
+
     /// Wipe the storage, drop all pages and delete the base directory.
     ///
     /// Takes ownership because this function leaves Blobstore in an inconsistent state which does
@@ -216,6 +244,15 @@ where
         match inner {
             BlobstoreInner::Gridstore(storage) => storage.wipe(&fs),
             BlobstoreInner::Logstore(storage) => storage.wipe(&fs),
+        }
+    }
+
+    /// Heap RAM held beyond the page cache of [`Self::files`]: the value mappings, when they are
+    /// held compacted, see [`Self::make_immutable`].
+    pub fn ram_usage_bytes(&self) -> usize {
+        match &self.inner {
+            BlobstoreInner::Gridstore(_) => 0,
+            BlobstoreInner::Logstore(storage) => storage.ram_usage_bytes(),
         }
     }
 

@@ -3,15 +3,19 @@
 //! read the exact same on-disk files, so vector search, filtered reads and
 //! payload reads must match point-for-point.
 
+use std::assert_matches;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::flags::FeatureFlags;
 use common::types::DeferredBehavior;
 use common::universal_io::{MmapFile, MmapFs};
+use rstest::rstest;
 use tempfile::Builder;
 
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::data_types::load_profile::LoadProfile;
 use crate::data_types::named_vectors::NamedVectors;
 use crate::data_types::query_context::QueryContext;
@@ -25,9 +29,10 @@ use crate::segment::read_only::ReadOnlySegment;
 use crate::segment_constructor::build_segment;
 use crate::segment_constructor::segment_builder::SegmentBuilder;
 use crate::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, HnswGlobalConfig, Indexes, Match,
-    PayloadFieldSchema, PayloadSchemaType, PointIdType, SegmentConfig, ValueVariants,
-    VectorDataConfig, VectorStorageType, WithPayload,
+    Condition, Distance, FieldCondition, Filter, HasVectorCondition, HnswConfig, HnswGlobalConfig,
+    Indexes, Match, PayloadFieldSchema, PayloadSchemaType, PointIdType, QuantizationConfig,
+    ScalarQuantizationConfig, ScalarType, SegmentConfig, ValueVariants, VectorDataConfig,
+    VectorStorageType, WithPayload,
 };
 
 const DIM: usize = 8;
@@ -37,7 +42,12 @@ const NUM_POINTS: usize = 100;
 /// indexed payload fields) the read-only opener can consume: an appendable
 /// source is populated, then optimized into the immutable target by
 /// `SegmentBuilder` (Mmap storage forces `is_appendable() = false`).
-fn build_immutable_segment(segments_path: &Path, temp_path: &Path) -> Segment {
+/// With `inline_storage` the build ends up graph-backed (`GraphInline`).
+fn build_immutable_segment(
+    segments_path: &Path,
+    temp_path: &Path,
+    inline_storage: bool,
+) -> Segment {
     let hw = HardwareCounterCell::new();
 
     let source_dir = Builder::new().prefix("ro_source").tempdir().unwrap();
@@ -100,6 +110,15 @@ fn build_immutable_segment(segments_path: &Path, temp_path: &Path) -> Segment {
         )
         .unwrap();
 
+    #[expect(deprecated, reason = "always_ram")]
+    let quantization_config = inline_storage.then(|| {
+        QuantizationConfig::from(ScalarQuantizationConfig {
+            r#type: ScalarType::Int8,
+            quantile: None,
+            always_ram: None,
+            memory: None,
+        })
+    });
     let target_config = SegmentConfig {
         vector_data: HashMap::from([(
             DEFAULT_VECTOR_NAME.to_owned(),
@@ -107,8 +126,11 @@ fn build_immutable_segment(segments_path: &Path, temp_path: &Path) -> Segment {
                 size: DIM,
                 distance: Distance::Cosine,
                 storage_type: VectorStorageType::Mmap,
-                index: Indexes::Hnsw(HnswConfig::default()),
-                quantization_config: None,
+                index: Indexes::Hnsw(HnswConfig {
+                    inline_storage: inline_storage.then_some(true),
+                    ..HnswConfig::default()
+                }),
+                quantization_config,
                 multivector_config: None,
                 datatype: None,
             },
@@ -119,12 +141,27 @@ fn build_immutable_segment(segments_path: &Path, temp_path: &Path) -> Segment {
     };
     assert!(!target_config.is_appendable());
 
-    let mut builder =
-        SegmentBuilder::new(temp_path, &target_config, &HnswGlobalConfig::default()).unwrap();
+    let mut builder = SegmentBuilder::new(
+        temp_path,
+        &target_config,
+        &HnswGlobalConfig::default(),
+        FeatureFlags::default(),
+    )
+    .unwrap();
     builder
         .update(&[&source], &AtomicBool::new(false), &hw)
         .unwrap();
-    builder.build_for_test(segments_path)
+    let built = builder.build_for_test(segments_path);
+    let expected_storage_type = if inline_storage {
+        VectorStorageType::GraphInline
+    } else {
+        VectorStorageType::Mmap
+    };
+    assert_eq!(
+        built.segment_config.vector_data[DEFAULT_VECTOR_NAME].storage_type,
+        expected_storage_type,
+    );
+    built
 }
 
 fn keyword_filter(value: &str) -> Filter {
@@ -203,6 +240,14 @@ fn assert_query_equivalence(reference: &impl ReadSegmentEntry, candidate: &impl 
     for i in 0..NUM_POINTS {
         let point_id: PointIdType = (i as u64 + 1).into();
         assert_eq!(
+            reference.point_version(point_id).is_some(),
+            candidate.point_version(point_id).is_some(),
+            "visibility mismatch for point {point_id}",
+        );
+        if reference.point_version(point_id).is_none() {
+            continue;
+        }
+        assert_eq!(
             reference.payload(point_id, &hw).unwrap(),
             candidate.payload(point_id, &hw).unwrap(),
             "payload mismatch for point {point_id}",
@@ -215,7 +260,7 @@ fn read_only_segment_matches_mutable() {
     let segments_dir = Builder::new().prefix("ro_segments").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("ro_builder").tempdir().unwrap();
 
-    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path());
+    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path(), false);
     let segment_path = mutable.data_path();
     let segment_uuid = mutable.uuid;
 
@@ -230,15 +275,58 @@ fn read_only_segment_matches_mutable() {
     assert_query_equivalence(&mutable, &read_only);
 }
 
+#[test]
+fn read_only_segment_graph_inline_matches_mutable() {
+    let segments_dir = Builder::new().prefix("ro_segments_gi").tempdir().unwrap();
+    let temp_dir = Builder::new().prefix("ro_builder_gi").tempdir().unwrap();
+
+    let mut mutable = build_immutable_segment(segments_dir.path(), temp_dir.path(), true);
+    let hw = HardwareCounterCell::new();
+
+    let deleted: [PointIdType; 3] = [3.into(), 17.into(), 42.into()];
+    for &point_id in &deleted {
+        assert_matches!(
+            mutable.delete_point(NUM_POINTS as u64 + 3, point_id, &hw),
+            Ok(true),
+        );
+    }
+    let without_vector: PointIdType = 7.into();
+    assert_matches!(
+        mutable.delete_vector(NUM_POINTS as u64 + 4, without_vector, DEFAULT_VECTOR_NAME),
+        Ok(true),
+    );
+    mutable.flush(true).unwrap();
+
+    let read_only =
+        ReadOnlySegment::<MmapFile>::open(&MmapFs, &mutable.data_path(), mutable.uuid, None, None)
+            .expect("read-only open");
+
+    assert_eq!(
+        read_only.available_point_count(),
+        NUM_POINTS - deleted.len(),
+    );
+    let has_vector = Filter::new_must(Condition::HasVector(HasVectorCondition::from(
+        DEFAULT_VECTOR_NAME.to_owned(),
+    )));
+    let with_vector = sorted_filtered(&read_only, &has_vector);
+    assert_eq!(with_vector.len(), NUM_POINTS - deleted.len() - 1);
+    assert!(!with_vector.contains(&without_vector));
+    assert_eq!(with_vector, sorted_filtered(&mutable, &has_vector));
+
+    assert_query_equivalence(&mutable, &read_only);
+}
+
 /// A request-specific [`LoadProfile`] only demotes placement, never disables a
 /// component: whatever the profile, every query the segment can serve must
 /// still answer identically to the mutable reference.
-#[test]
-fn read_only_segment_with_load_profile_matches_mutable() {
+#[rstest]
+#[case::mmap(false)]
+#[case::graph_inline(true)]
+fn read_only_segment_with_load_profile_matches_mutable(#[case] inline_storage: bool) {
     let segments_dir = Builder::new().prefix("ro_segments_lp").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("ro_builder_lp").tempdir().unwrap();
 
-    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path());
+    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path(), inline_storage);
     let segment_path = mutable.data_path();
     let segment_uuid = mutable.uuid;
 
@@ -268,6 +356,68 @@ fn read_only_segment_with_load_profile_matches_mutable() {
     }
 }
 
+/// A profile's deferred-points threshold hides the tail of an appendable segment: 1 KB of
+/// `DIM` f32 vectors is 32 points, so only the first 32 inserted points stay visible.
+#[test]
+fn read_only_segment_load_profile_defers_points() {
+    let dir = Builder::new().prefix("ro_deferred").tempdir().unwrap();
+    let hw = HardwareCounterCell::new();
+
+    let (mut mutable, _) = build_segment(
+        dir.path(),
+        &SegmentConfig {
+            vector_data: HashMap::from([(
+                DEFAULT_VECTOR_NAME.to_owned(),
+                VectorDataConfig {
+                    size: DIM,
+                    distance: Distance::Dot,
+                    storage_type: VectorStorageType::default(),
+                    index: Indexes::Plain {},
+                    quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
+                },
+            )]),
+            sparse_vector_data: Default::default(),
+            payload_storage_type: Default::default(),
+            id_tracker_memory: None,
+        },
+        None,
+        true,
+    )
+    .unwrap();
+    for i in 0..NUM_POINTS {
+        let vector = vec![1.0; DIM];
+        let vectors = NamedVectors::from_ref(DEFAULT_VECTOR_NAME, vector.as_slice().into());
+        mutable
+            .upsert_point((i + 1) as u64, (i as u64 + 1).into(), vectors, &hw)
+            .unwrap();
+    }
+    mutable.flush(true).unwrap();
+
+    let profile = LoadProfile::for_retrieve().with_deferred_points_threshold_kb(Some(1));
+    let read_only = ReadOnlySegment::<MmapFile>::open(
+        &MmapFs,
+        &mutable.data_path(),
+        mutable.uuid,
+        None,
+        Some(&profile),
+    )
+    .expect("read-only open with deferred threshold");
+
+    assert_eq!(read_only.available_point_count_without_deferred(), 32);
+    assert!(read_only.has_point(32.into(), DeferredBehavior::VisibleOnly));
+    assert!(!read_only.has_point(33.into(), DeferredBehavior::VisibleOnly));
+
+    let unfiltered =
+        ReadOnlySegment::<MmapFile>::open(&MmapFs, &mutable.data_path(), mutable.uuid, None, None)
+            .expect("read-only open");
+    assert_eq!(
+        unfiltered.available_point_count_without_deferred(),
+        NUM_POINTS
+    );
+}
+
 /// Open a segment straight from an S3-compatible store (rustfs/minio) over
 /// `BlobFs` and assert it answers queries identically to the local reference.
 ///
@@ -277,7 +427,7 @@ fn read_only_segment_with_load_profile_matches_mutable() {
 #[ignore = "requires a running S3-compatible server (set S3_INTEGRATION_TEST=1)"]
 fn read_only_segment_over_s3() {
     use bytes::Bytes;
-    use common::universal_io::UniversalReadFileOps;
+    use common::universal_io::UniversalReadFs;
     use io_bridge_object_store::backends::aws::{AwsConfig, AwsCredentials};
     use io_bridge_object_store::{BlobBackend, BlobFile, BlobFs, ObjectStoreSource};
     use object_store::ObjectStoreExt;
@@ -309,7 +459,7 @@ fn read_only_segment_over_s3() {
     // Build an immutable segment locally as the reference.
     let segments_dir = Builder::new().prefix("ro_s3_segments").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("ro_s3_builder").tempdir().unwrap();
-    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path());
+    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path(), false);
     let segment_uuid = mutable.uuid;
     let local_path = mutable.data_path();
 
@@ -498,7 +648,7 @@ fn preload_then_reload(
     segment: &mut ReadOnlySegment<MmapFile>,
     hw_counter: &HardwareCounterCell,
 ) -> crate::common::operation_error::OperationResult<()> {
-    futures::executor::block_on(segment.live_preload()?);
+    futures::executor::block_on(segment.live_preload(&AtomicBool::new(false)))?;
     segment.live_reload(hw_counter)
 }
 
@@ -514,7 +664,7 @@ fn read_only_segment_config_reload_payload_index() {
     let segments_dir = Builder::new().prefix("ro_cfg_segments").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("ro_cfg_builder").tempdir().unwrap();
 
-    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path());
+    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path(), false);
     let segment_path = mutable.data_path();
     let segment_uuid = mutable.uuid;
 
@@ -588,7 +738,7 @@ fn vanished_segment_classifies_not_found() {
     let segments_dir = Builder::new().prefix("ro_segments").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("ro_builder").tempdir().unwrap();
 
-    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path());
+    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path(), false);
     let segment_path = mutable.data_path();
     let segment_uuid = mutable.uuid;
     drop(mutable);
@@ -632,7 +782,7 @@ fn deferred_index_reads_nothing_at_open() {
     let segments_dir = Builder::new().prefix("ro_segments").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("ro_builder").tempdir().unwrap();
 
-    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path());
+    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path(), false);
     let segment_path = mutable.data_path();
     let segment_uuid = mutable.uuid;
     drop(mutable);
@@ -685,7 +835,7 @@ fn deferred_index_opens_on_first_search() {
     let segments_dir = Builder::new().prefix("ro_segments").tempdir().unwrap();
     let temp_dir = Builder::new().prefix("ro_builder").tempdir().unwrap();
 
-    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path());
+    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path(), false);
     let segment_path = mutable.data_path();
     let segment_uuid = mutable.uuid;
     drop(mutable);
@@ -704,4 +854,65 @@ fn deferred_index_opens_on_first_search() {
     .expect("open with a deferred index");
 
     assert_query_equivalence(&eager, &deferred);
+}
+
+/// The stop flag is observed both while staging an open and while assembling
+/// it, and an unset flag changes nothing.
+#[test]
+fn schedule_open_and_finish_observe_the_stop_flag() {
+    let segments_dir = Builder::new().prefix("ro_segments_stop").tempdir().unwrap();
+    let temp_dir = Builder::new().prefix("ro_builder_stop").tempdir().unwrap();
+
+    let mutable = build_immutable_segment(segments_dir.path(), temp_dir.path(), false);
+    let segment_path = mutable.data_path();
+    let segment_uuid = mutable.uuid;
+
+    let is_cancelled = |result: OperationResult<ReadOnlySegment<MmapFile>>| {
+        matches!(result, Err(OperationError::Cancelled { .. }))
+    };
+
+    // Already cancelled: staging refuses before scheduling anything.
+    let stopped = AtomicBool::new(true);
+    let staged = ReadOnlySegment::<MmapFile>::schedule_open(
+        &MmapFs,
+        &segment_path,
+        segment_uuid,
+        None,
+        None,
+        &stopped,
+    );
+    assert!(matches!(staged, Err(OperationError::Cancelled { .. })));
+    assert!(stopped.load(Ordering::Relaxed));
+
+    // Cancelled between staging and assembly: `finish` refuses.
+    let stopped = AtomicBool::new(false);
+    let staged = ReadOnlySegment::<MmapFile>::schedule_open(
+        &MmapFs,
+        &segment_path,
+        segment_uuid,
+        None,
+        None,
+        &stopped,
+    )
+    .unwrap();
+    stopped.store(true, Ordering::Relaxed);
+    assert!(is_cancelled(staged.finish(&MmapFs)));
+    assert!(stopped.load(Ordering::Relaxed));
+
+    // Never cancelled: identical to the plain open, and the flag is left alone.
+    let stopped = AtomicBool::new(false);
+    let read_only = ReadOnlySegment::<MmapFile>::schedule_open(
+        &MmapFs,
+        &segment_path,
+        segment_uuid,
+        None,
+        None,
+        &stopped,
+    )
+    .unwrap()
+    .finish(&MmapFs)
+    .unwrap();
+    assert!(!stopped.load(Ordering::Relaxed));
+    assert_eq!(read_only.available_point_count(), NUM_POINTS);
+    assert_query_equivalence(&mutable, &read_only);
 }

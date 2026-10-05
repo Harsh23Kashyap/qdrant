@@ -1,18 +1,125 @@
 use std::borrow::Cow;
+use std::sync::atomic::AtomicBool;
 
 use ahash::AHashMap;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::iterator_ext::IteratorExt;
-use common::types::PointOffsetType;
+use common::types::{PointOffsetType, ScoredPointOffset};
 use common::universal_io::UserData;
 
+use super::inverted_index::bm25::{Bm25Params, Bm25Query, Bm25Term};
 use super::inverted_index::{Document, ParsedQuery, TokenId, TokenSet};
 use super::tokenizers::{Tokenizer, TokenizerTextKind};
-use crate::common::operation_error::OperationResult;
+use crate::common::operation_error::{OperationResult, check_process_stopped};
+use crate::data_types::query_context::{TextFieldStats, TextQueryContext};
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition, ValueIndexer};
 use crate::index::payload_config::StorageType;
 use crate::telemetry::PayloadIndexTelemetry;
 use crate::types::{FieldCondition, PayloadKeyType};
+
+/// Add one segment's contribution to a text field's corpus statistics: the
+/// document frequency of every seeded term, the document count, and the total
+/// tokens behind `avgdl`.
+///
+/// Terms are resolved per segment: a `TokenId` is local to the vocabulary that
+/// assigned it, so the query's strings are the only key the segments share.
+/// **Seeded terms must already be tokenized.** Resolution is a bare vocabulary
+/// lookup, so an untokenized term misses everywhere and keeps its seeded `df`
+/// of zero, the largest IDF the formula produces. A debug build checks it.
+pub fn fill_text_statistics<T: FullTextIndexRead>(
+    index: &T,
+    stats: &mut TextFieldStats,
+    is_stopped: &AtomicBool,
+    hw_counter: &HardwareCounterCell,
+) -> OperationResult<()> {
+    debug_assert!(
+        stats.df.keys().all(|term| is_tokenized(index, term)),
+        "seeded terms must already be tokenized",
+    );
+
+    check_process_stopped(is_stopped)?;
+
+    // The destination slot travels as user data, so no term is cloned.
+    let mut counts: Vec<(&mut usize, usize)> = Vec::with_capacity(stats.df.len());
+    index.for_each_token_id(
+        stats.df.iter_mut().map(|(term, df)| (df, term.as_str())),
+        hw_counter,
+        |df, token_id| {
+            if let Some(token_id) = token_id {
+                counts.push((df, token_id as usize));
+            }
+        },
+    )?;
+
+    for (df, token_id) in counts {
+        check_process_stopped(is_stopped)?;
+        if let Some(posting_len) = index.posting_len(token_id as TokenId, hw_counter)? {
+            *df += posting_len;
+        }
+    }
+
+    stats.add_segment(index.points_count(), index.total_tokens());
+    Ok(())
+}
+
+/// Whether `term` survives this index's tokenizer unchanged, which is what
+/// [`fill_text_statistics`] requires of the terms it is asked to count.
+fn is_tokenized<T: FullTextIndexRead>(index: &T, term: &str) -> bool {
+    let mut tokens = Vec::with_capacity(1);
+    index
+        .tokenizer()
+        .tokenize_query(term, |token| tokens.push(token.into_owned()));
+    tokens == [term]
+}
+
+/// Score `terms` against one segment by BM25 and return the `limit` best
+/// documents, highest first.
+///
+/// `terms` are resolved to this segment's token ids; a term the segment never
+/// saw contributes nothing. Their `IDF` and the average document length come
+/// from `context`, which was gathered over every segment of the shard, so a
+/// document scores the same whichever segment holds it. **Seeded terms must
+/// already be tokenized**, for the same reason as in [`fill_text_statistics`].
+///
+/// `accept` decides which documents may be scored at all: the id tracker's
+/// deletions and any outer filter. Deletions the index itself knows about are
+/// applied inside.
+#[allow(clippy::too_many_arguments)]
+pub fn score_bm25<T: FullTextIndexRead>(
+    index: &T,
+    terms: &[String],
+    context: &TextQueryContext<'_>,
+    params: Bm25Params,
+    accept: &dyn Fn(PointOffsetType) -> bool,
+    limit: usize,
+    is_stopped: &AtomicBool,
+    hw_counter: &HardwareCounterCell,
+) -> OperationResult<Vec<ScoredPointOffset>> {
+    debug_assert!(
+        terms.iter().all(|term| is_tokenized(index, term)),
+        "query terms must already be tokenized",
+    );
+
+    let mut resolved = Vec::with_capacity(terms.len());
+    index.for_each_token_id(
+        terms.iter().enumerate().map(|(i, term)| (i, term.as_str())),
+        hw_counter,
+        |i, token_id| {
+            if let Some(token_id) = token_id {
+                resolved.push(Bm25Term {
+                    token_id,
+                    idf: context.idf(&terms[i]),
+                });
+            }
+        },
+    )?;
+    if resolved.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query = Bm25Query::new(resolved, params, context.avg_doc_len())?;
+    index.score_bm25(&query, accept, limit, is_stopped, hw_counter)
+}
 
 /// Selects how a text query is parsed and matched against the payload.
 pub enum PayloadMatchQueryType {
@@ -57,6 +164,63 @@ pub trait FullTextIndexRead {
     fn points_count(&self) -> usize;
     fn values_count(&self, point_id: PointOffsetType) -> usize;
     fn values_is_empty(&self, point_id: PointOffsetType) -> bool;
+
+    /// Number of tokens indexed for each of `point_ids`, repetitions included:
+    /// `|d|` in BM25. `f(index, doc_len)` once per entry, with `index` into
+    /// `point_ids`, in no particular order. `None` when this index does not
+    /// record lengths or the point is outside it, `Some(0)` when it holds no
+    /// tokens for that point, whether because the document was deleted or
+    /// because its tokens were all filtered away. Every backend answers
+    /// identically for the same data.
+    ///
+    /// Batched only, on purpose: an on-disk index may sit on a slow or remote
+    /// disk, where a length read per point is a round trip per point.
+    fn doc_len_batch(
+        &self,
+        point_ids: &[PointOffsetType],
+        hw_counter: &HardwareCounterCell,
+        f: impl FnMut(usize, Option<u32>),
+    ) -> OperationResult<()>;
+
+    /// Total tokens over the points this index still holds. Paired with
+    /// [`Self::points_count`] it gives an average document length, but the
+    /// division belongs to whoever has summed both over every segment, not
+    /// here.
+    ///
+    /// Both are counted over the documents that carry at least one indexed
+    /// token. A value that tokenizes to nothing is in neither, so that does
+    /// not move the ratio across storage placements. Deletions since the last
+    /// build do: the on-disk index returns its build-time total, which still
+    /// counts them as [`Self::posting_len`] does, while the immutable index
+    /// loaded from the same files subtracts them.
+    fn total_tokens(&self) -> Option<u64>;
+
+    /// The `limit` best documents for `query` by BM25, highest first, among
+    /// those `accept` allows. `query` carries corpus-wide `IDF` and `avgdl`
+    /// and this segment's token ids; see [`score_bm25`] for how it is built.
+    /// An index built without positions cannot compute term frequencies and
+    /// reports an error.
+    fn score_bm25(
+        &self,
+        query: &Bm25Query,
+        accept: &dyn Fn(PointOffsetType) -> bool,
+        limit: usize,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Vec<ScoredPointOffset>>;
+
+    /// Documents in this segment containing `token_id`: `df(t)` before it is
+    /// summed across segments. `None` when the token is not in the vocabulary.
+    ///
+    /// Counts what the posting list holds. The mutable index removes deleted
+    /// points from its postings; the immutable and on-disk ones keep them until
+    /// the segment is rebuilt. So `df` can exceed `N`, and the same data can
+    /// report a different `df` before and after an optimization.
+    fn posting_len(
+        &self,
+        token_id: TokenId,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<usize>>;
 
     fn for_each_token_id<'a, U: UserData>(
         &self,

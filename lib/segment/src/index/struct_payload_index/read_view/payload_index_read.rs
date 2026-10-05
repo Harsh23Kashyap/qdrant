@@ -8,12 +8,14 @@ use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
 use common::either_variant::EitherVariant;
 use common::generic_consts::AccessPattern;
 use common::iterator_ext::IteratorExt;
-use common::types::{DeferredBehavior, PointOffsetType, ScoreType};
+use common::types::{DeferredBehavior, PointOffsetType, ScoreType, ScoredPointOffset};
 
 use super::StructPayloadIndexReadView;
 use crate::common::operation_error::OperationResult;
+use crate::data_types::query_context::{TextFieldStats, TextQueryContext};
 use crate::id_tracker::IdTrackerRead;
 use crate::index::PayloadIndexRead;
+use crate::index::field_index::full_text_index::Bm25Params;
 use crate::index::field_index::numeric_index::NumericFieldIndexRead;
 use crate::index::field_index::{
     CardinalityEstimation, FacetIndex, FieldIndexRead, PayloadBlockCondition,
@@ -96,6 +98,46 @@ where
         self.field_indexes
             .get(key)
             .and_then(|indexes| indexes.iter().find_map(|index| index.as_numeric()))
+    }
+
+    fn fill_text_statistics(
+        &self,
+        field: PayloadKeyTypeRef,
+        stats: &mut TextFieldStats,
+        is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        let Some(indexes) = self.field_indexes.get(field) else {
+            return Ok(());
+        };
+        // At most one text index per field.
+        for index in indexes {
+            if index.fill_text_statistics(stats, is_stopped, hw_counter)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn score_bm25(
+        &self,
+        field: PayloadKeyTypeRef,
+        terms: &[String],
+        context: &TextQueryContext<'_>,
+        params: Bm25Params,
+        accept: &dyn Fn(PointOffsetType) -> bool,
+        limit: usize,
+    ) -> OperationResult<Vec<ScoredPointOffset>> {
+        let Some(indexes) = self.field_indexes.get(field) else {
+            return Ok(Vec::new());
+        };
+        // At most one text index per field.
+        for index in indexes {
+            if let Some(scored) = index.score_bm25(terms, context, params, accept, limit)? {
+                return Ok(scored);
+            }
+        }
+        Ok(Vec::new())
     }
 
     fn get_telemetry_data(&self) -> OperationResult<Vec<PayloadIndexTelemetry>> {

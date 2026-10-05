@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::defaults;
-use fs_err::tokio as tokio_fs;
 use parking_lot::Mutex;
 use semver::Version;
 use tokio_util::task::AbortOnDropHandle;
@@ -17,11 +16,11 @@ use crate::shards::local_shard::LocalShard;
 use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::shard_holder::ShardHolder;
+use crate::shards::transfer;
 use crate::shards::transfer::transfer_tasks_pool::{TransferTaskItem, TransferTaskProgress};
 use crate::shards::transfer::{
     ShardTransfer, ShardTransferConsensus, ShardTransferKey, ShardTransferMethod,
 };
-use crate::shards::{shard_initializing_flag_path, transfer};
 
 impl Collection {
     pub async fn get_related_transfers(&self, current_peer_id: PeerId) -> Vec<ShardTransfer> {
@@ -150,6 +149,18 @@ impl Collection {
             shard_transfer.method = Some(default_method);
         }
 
+        // Staging-only: pause the sender before it registers anything of the `Start`, so a test
+        // can kill this peer while the entry is committed but not yet applied. On restart the
+        // entry is replayed before this peer rejoins consensus, spawning a driver for a transfer
+        // the rest of the cluster may have aborted since.
+        #[cfg(feature = "staging")]
+        if consensus.this_peer_id() == shard_transfer.from
+            && let Ok(secs) = std::env::var("QDRANT_STAGING_SHARD_TRANSFER_START_DELAY_SEC")
+            && let Ok(secs) = secs.parse::<f64>()
+        {
+            tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
+        }
+
         let do_transfer = {
             let this_peer_id = consensus.this_peer_id();
             let is_receiver = this_peer_id == shard_transfer.to;
@@ -171,18 +182,18 @@ impl Collection {
                 CollectionError::bad_request(format!("shard {to_shard_id} doesn't exist"))
             })?;
 
-            let _was_not_transferred =
-                shards_holder.register_start_shard_transfer(shard_transfer.clone())?;
-
-            let from_is_local = from_replica_set.is_local().await;
-            let to_is_local = to_replica_set.is_local().await;
-
             // Checked at the top of the function — the method is always set by the
             // peer that submitted this transfer to consensus.
             let transfer_method = shard_transfer.method.expect("transfer method must be set");
             let initial_state = self
                 .initial_replica_state_for_transfer(transfer_method)
                 .await?;
+
+            let _was_not_transferred =
+                shards_holder.register_start_shard_transfer(shard_transfer.clone())?;
+
+            let from_is_local = from_replica_set.is_local().await;
+            let to_is_local = to_replica_set.is_local().await;
 
             // Create local shard if it does not exist on receiver, or simply set replica state otherwise
             // (on all peers, regardless if shard is local or remote on that peer).
@@ -385,7 +396,7 @@ impl Collection {
             //    proposed as a WAL-delta transfer fallback (never resharding), and the
             //    fallback method fully re-populates the destination.
             if is_receiver {
-                dest_replica_set.init_empty_local_shard().await?;
+                dest_replica_set.init_empty_local_shard(&self.path).await?;
             }
 
             // 5. All peers: set the destination replica to the new method's
@@ -661,9 +672,14 @@ impl Collection {
     /// If the shard was in dummy state, it will be recreated. Aborting this may leave it in
     /// partial state. In that case it will remain a dummy shard, signaled by the initialization
     /// flag on disk. It may then be fully reinitialized on the next transfer attempt.
+    ///
+    /// If `from_peer_id` is given, only a transfer from that peer is accepted. A sender that
+    /// drives a transfer consensus has since aborted must not be able to piggyback on another
+    /// transfer into this shard.
     pub fn initiate_shard_transfer(
         &self,
         shard_id: ShardId,
+        from_peer_id: Option<PeerId>,
     ) -> impl Future<Output = CollectionResult<()>> + 'static {
         let shards_holder = self.shards_holder.clone();
 
@@ -685,12 +701,10 @@ impl Collection {
                 .await?;
 
             let this_peer_id = replica_set.this_peer_id();
+            let replica_set = Arc::clone(replica_set);
 
             let shard_transfer_requested = tokio::task::spawn_blocking(move || {
-                // We can guarantee that replica_set is not None, cause we checked it before
-                // and `shards_holder` is holding the lock.
-                // This is a workaround for lifetime checker.
-                let replica_set = shards_holder_guard.get_shard(shard_id).unwrap();
+                // Wait for transfer targeting this replica
                 let shard_transfer_registered = shards_holder_guard.shard_transfers.wait_for(
                     |shard_transfers| {
                         shard_transfers
@@ -700,23 +714,44 @@ impl Collection {
                     Duration::from_secs(60),
                 );
 
-                // It is not enough to check for shard_transfer_registered,
-                // because it is registered before the state of the shard is changed.
-                shard_transfer_registered
-                    && replica_set.wait_for_state_condition_sync(
-                        |state| {
-                            state
-                                .get_peer_state(this_peer_id)
-                                .is_some_and(|peer_state| peer_state.is_partial_or_recovery())
-                        },
-                        defaults::CONSENSUS_META_OP_WAIT,
-                    )
+                // Reject request, if no transfer was registered within 60 seconds
+                if !shard_transfer_registered {
+                    return Ok(false);
+                }
+
+                // Check that request comes from expected sender
+                if let Some(from_peer_id) = from_peer_id {
+                    let transfers = shards_holder_guard
+                        .get_transfers(|transfer| transfer.is_target(this_peer_id, shard_id));
+
+                    let is_expected_sender = transfers
+                        .iter()
+                        .any(|transfer| transfer.from == from_peer_id);
+
+                    if !is_expected_sender {
+                        return Err(CollectionError::bad_request(format!(
+                            "Refusing to initiate shard transfer from peer {from_peer_id} into shard {shard_id}: \
+                             there is no registered transfer from peer {from_peer_id}",
+                        )));
+                    }
+                }
+
+                // Transfer is registered before the replica state is set.
+                // Wait until the local replica switches to a shard transfer state.
+                Ok(replica_set.wait_for_state_condition_sync(
+                    |state| {
+                        state
+                            .get_peer_state(this_peer_id)
+                            .is_some_and(|peer_state| peer_state.is_partial_or_recovery())
+                    },
+                    defaults::CONSENSUS_META_OP_WAIT,
+                ))
             });
 
             match AbortOnDropHandle::new(shard_transfer_requested).await {
-                Ok(true) => Ok(()),
+                Ok(Ok(true)) => Ok(()),
 
-                Ok(false) => {
+                Ok(Ok(false)) => {
                     let description = "\
                         Failed to initiate shard transfer: \
                         Didn't receive shard transfer notification from consensus in 60 seconds";
@@ -725,6 +760,8 @@ impl Collection {
                         description: description.into(),
                     })
                 }
+
+                Ok(Err(err)) => Err(err),
 
                 Err(err) => Err(CollectionError::service_error(format!(
                     "Failed to initiate shard transfer: \
@@ -762,16 +799,9 @@ impl Collection {
                     "Initiating transfer to dummy shard {}. Initializing empty local shard first",
                     replica_set.shard_id,
                 );
-                replica_set.init_empty_local_shard().await?;
-
-                let shard_flag = shard_initializing_flag_path(&collection_path, shard_id);
-
-                if tokio_fs::try_exists(&shard_flag).await.is_ok() {
-                    // We can delete initializing flag without waiting for transfer to finish
-                    // because if transfer fails in between, Qdrant will retry it.
-                    tokio_fs::remove_file(&shard_flag).await?;
-                    log::debug!("Removed shard initializing flag {shard_flag:?}");
-                }
+                // Also removes the initializing flag. We can do this without waiting for the
+                // transfer to finish, because if the transfer fails in between, Qdrant will retry it.
+                replica_set.init_empty_local_shard(&collection_path).await?;
             }
 
             Ok(())

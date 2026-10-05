@@ -527,6 +527,22 @@ pub async fn run(
 ) {
     assert_candidates_predictable();
 
+    // The `t` text index: where optimized segments keep it (RAM or disk, so both scorers and both
+    // length read paths run) and how it tokenizes. Keyed off the seed rather than drawn, so the op
+    // stream is the same.
+    let text_params = fixture::text_index_params(seed);
+    println!(
+        "model_testing: text index memory={:?} tokenizer={:?} lowercase={:?} min/max={:?}/{:?} \
+         stopwords={:?} stemmer={:?} ascii_folding={:?}",
+        text_params.memory,
+        text_params.tokenizer,
+        text_params.lowercase,
+        text_params.min_token_len,
+        text_params.max_token_len,
+        text_params.stopwords,
+        text_params.stemmer,
+        text_params.ascii_folding,
+    );
     let (collection_dir, snapshots_dir, collection) = fixture::fixture(
         shard_count,
         storage_path,
@@ -534,6 +550,7 @@ pub async fn run(
         max_segment_size_kb,
         indexing_threshold_kb,
         on_disk,
+        text_params,
     )
     .await;
     // `Arc` so a background `CreateSnapshot` task can hold the collection alive while the main loop
@@ -682,6 +699,10 @@ pub async fn run(
         if do_restart {
             log::debug!("op:{i} Restart");
             bar.set_message("Restart");
+            // println! (not log::): harness unit tests don't init a logger, and nextest only
+            // dumps captured stdout on failure/timeout — these breadcrumbs are how a hung restart
+            // tells us which stage it never left.
+            stage_breadcrumb(&bar, &format!("op:{i} Restart"));
             let (pre_segments, pre_optimized) = verify::run_summary(&collection).await;
             if pre_optimized > 0 {
                 optimizer_ran_during_run = true;
@@ -725,14 +746,14 @@ pub async fn run(
             // the `drop` below wouldn't actually close the collection (releasing its files) until
             // the task ends — and reopening the same dir with the old collection still open is
             // unsafe.
-            log::info!("op:{i} restart: drain_snapshot");
+            stage_breadcrumb(&bar, &format!("op:{i} restart: drain_snapshot"));
             drain_snapshot(&collection, &snapshots_dir, &mut pending_snapshot, i).await;
             // Newest-clocks recovery point must survive the close+reopen exactly; captured here
             // (snapshot drained, op loop idle) and compared after the reload below. See
             // [`verify::assert_clocks_match`] for why both mismatch directions are bugs.
-            log::info!("op:{i} restart: collect_clock_ticks");
+            stage_breadcrumb(&bar, &format!("op:{i} restart: collect_clock_ticks"));
             let pre_clocks = verify::collect_clock_ticks(&collection).await;
-            log::info!("op:{i} restart: stop_gracefully");
+            stage_breadcrumb(&bar, &format!("op:{i} restart: stop_gracefully"));
             collection.stop_gracefully().await;
             // `into_inner` makes the invariant checked, not assumed: if any background task still
             // holds an `Arc` clone here, panic loudly instead of reopening the same dir while the
@@ -741,16 +762,16 @@ pub async fn run(
                 Arc::into_inner(collection)
                     .expect("collection still referenced at restart (undrained background task?)"),
             );
-            log::info!("op:{i} restart: reopen");
+            stage_breadcrumb(&bar, &format!("op:{i} restart: reopen"));
             collection =
                 Arc::new(fixture::reopen_collection(&collection_dir, &snapshots_dir).await);
             // `Collection::load` returns before tail-of-WAL ops queued to the
             // update worker have been applied — that's an intentional fast-start
             // feature. Wait for the queue to drain so the scroll below observes
             // all WAL-replayed state.
-            log::info!("op:{i} restart: wait_for_pending_updates");
+            stage_breadcrumb(&bar, &format!("op:{i} restart: wait_for_pending_updates"));
             verify::wait_for_pending_updates(&collection).await;
-            log::info!("op:{i} restart: scroll + verify");
+            stage_breadcrumb(&bar, &format!("op:{i} restart: scroll + verify"));
             let live = verify::collect_model_from_collection(&collection).await;
             verify::assert_matches_model(&live, &model, &format!("restart at op:{i}"));
             // Clock check AFTER the model check: a lost WAL tail trips both, and the model diff
@@ -765,6 +786,11 @@ pub async fn run(
             let op = op::Op::random(rng, &model, &active_names, &id_space, &swarm);
             log::debug!("op:{i} {op:?}");
             bar.set_message(op.kind());
+            // Unit-test / nextest only: print the in-flight op so a timeout dump names the op
+            // that never returned. Omitted from the soak binary (cfg(test) off) so the progress
+            // bar isn't flooded on long runs.
+            #[cfg(test)]
+            stage_breadcrumb(&bar, &format!("op:{i} begin {}", op.kind()));
             // Log BEFORE apply so a panic preserves the offending op in the trace.
             trace.op(i, &op);
             // CreateSnapshot needs run-loop context (it spawns a background task against shared
@@ -791,7 +817,13 @@ pub async fn run(
                     log::debug!("op:{i} CreateSnapshot skipped (one already in flight)");
                 }
             } else {
-                apply::apply(&collection, &mut model, &mut active_names, &op).await;
+                // No segment is wrapped in a proxy: the optimizer is off, and no snapshot is
+                // proxying segments while it runs. Only then are statistics the model's.
+                let no_proxies = disable_optimizer
+                    && pending_snapshot
+                        .as_ref()
+                        .is_none_or(JoinHandle::is_finished);
+                apply::apply(&collection, &mut model, &mut active_names, &op, no_proxies).await;
             }
         }
         // Reap a finished background snapshot (non-blocking check); panics if it errored.
@@ -821,7 +853,7 @@ pub async fn run(
         eprintln!("model_testing: verifying live state...");
     }
     log::debug!("all ops applied, verifying live collection against model");
-    log::info!("live: scroll + verify");
+    stage_breadcrumb(&bar, "live: scroll + verify");
     let live = verify::collect_model_from_collection(&collection).await;
     let (live_extra, live_missing) = verify::id_diff(&live, &model);
     let (mut segments, mut optimized) = verify::run_summary(&collection).await;
@@ -843,7 +875,7 @@ pub async fn run(
     // not have triggered), when the optimizer is intentionally disabled, or when we
     // already observed optimization earlier in the run (counter resets on restart).
     if !interrupted && !disable_optimizer && !optimizer_ran_during_run {
-        log::info!("live: wait_for_optimizer");
+        stage_breadcrumb(&bar, "live: wait_for_optimizer");
         verify::wait_for_optimizer(&collection).await;
         (segments, optimized) = verify::run_summary(&collection).await;
     }
@@ -859,24 +891,24 @@ pub async fn run(
     }
     // Finish any background snapshot before closing (it holds an `Arc` clone — see the restart
     // path), then close and reopen and re-verify — mirrors blobstore tests.rs:488-516.
-    log::info!("reload: drain_snapshot");
+    stage_breadcrumb(&bar, "reload: drain_snapshot");
     drain_snapshot(&collection, &snapshots_dir, &mut pending_snapshot, applied).await;
     // Same clock-durability capture as the mid-run restart path, for the final reload.
     let pre_clocks = verify::collect_clock_ticks(&collection).await;
-    log::info!("reload: stop_gracefully");
+    stage_breadcrumb(&bar, "reload: stop_gracefully");
     collection.stop_gracefully().await;
     // Checked close-before-reopen, same as the mid-run restart path.
     drop(
         Arc::into_inner(collection)
             .expect("collection still referenced at final reload (undrained background task?)"),
     );
-    log::info!("reload: reopen");
+    stage_breadcrumb(&bar, "reload: reopen");
     let collection = fixture::reopen_collection(&collection_dir, &snapshots_dir).await;
     // Same reason as the mid-run restart above — drain deferred WAL ops before scrolling.
-    log::info!("reload: wait_for_pending_updates");
+    stage_breadcrumb(&bar, "reload: wait_for_pending_updates");
     verify::wait_for_pending_updates(&collection).await;
 
-    log::info!("reload: scroll + verify");
+    stage_breadcrumb(&bar, "reload: scroll + verify");
     let reloaded = verify::collect_model_from_collection(&collection).await;
     let (reload_extra, reload_missing) = verify::id_diff(&reloaded, &model);
     trace.reload_verify(
@@ -890,6 +922,14 @@ pub async fn run(
     // After the model check, same as the restart path (see the comment there for ordering).
     let post_clocks = verify::collect_clock_ticks(&collection).await;
     verify::assert_clocks_match(&pre_clocks, &post_clocks, "reloaded");
+}
+
+/// Print a stage/op breadcrumb to stdout so a nextest timeout/failure dump shows the last
+/// point reached. `log::info!` is a no-op here — harness tests never init a logger, and the
+/// soak binary's progress bar would hide stderr log lines on a TTY. `bar.suspend` keeps the
+/// line from being overwritten by the next progress-bar repaint.
+fn stage_breadcrumb(bar: &ProgressBar, msg: &str) {
+    bar.suspend(|| println!("model_testing: {msg}"));
 }
 
 /// Upper bound on how long we wait for a background snapshot to finish when draining it, so a hung
@@ -931,6 +971,140 @@ async fn drain_snapshot(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Harness seed support (test-only)
+//
+// These live outside the Linux-gated test module so they compile — and are unit tested — on
+// every platform, and so `mod tests` can reach them through its `use super::*`.
+// ---------------------------------------------------------------------------
+
+/// Environment variable that overrides the harness seed.
+///
+/// A failing run prints its seed; re-running the same test with this set replays that exact op
+/// sequence, which is what `--seed` already provides for the soak binary.
+#[cfg(test)]
+const SEED_ENV: &str = "MODEL_TESTING_SEED";
+
+// Harness knobs used by both `smoke` (which hands them to `run`) and the replay command it
+// prints, so a run and its printed reproduction cannot disagree about them.
+#[cfg(target_os = "linux")]
+#[cfg(test)]
+const HARNESS_ID_POOL: u64 = 500;
+#[cfg(test)]
+const HARNESS_SHARD_COUNT: u32 = 1;
+#[cfg(test)]
+const HARNESS_UUID_ID_FRACTION: f64 = 0.5;
+#[cfg(test)]
+const HARNESS_MAX_SEGMENT_SIZE_KB: usize = 10;
+#[cfg(test)]
+const HARNESS_INDEXING_THRESHOLD_KB: usize = 5;
+#[cfg(test)]
+const HARNESS_SWARM_INTERVAL: usize = 2500;
+
+/// Resolve the seed override from the process environment, distinguishing "not set" from
+/// "set but unusable".
+///
+/// Taken as a `Result` rather than read directly so the three outcomes are unit testable without
+/// mutating the environment. A garbled override must not silently fall back to a fresh seed: the
+/// point of the override is that the run reproduces one specific sequence.
+#[cfg(test)]
+fn seed_override(var: Result<String, std::env::VarError>) -> Option<String> {
+    match var {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err @ std::env::VarError::NotUnicode(_)) => {
+            panic!("{SEED_ENV} is set but unusable: {err}")
+        }
+    }
+}
+
+/// Resolve the harness seed: an explicit `MODEL_TESTING_SEED` wins, otherwise `draw_fresh` picks
+/// a new random seed so each run explores a different op sequence.
+///
+/// `draw_fresh` is a parameter rather than a direct `rand::rng()` call so the behaviour is unit
+/// testable without depending on random collisions.
+#[cfg(test)]
+fn resolve_seed(env_value: Option<&str>, mut draw_fresh: impl FnMut() -> u64) -> u64 {
+    match env_value.map(str::trim) {
+        None | Some("") => draw_fresh(),
+        Some(raw) => raw.parse().unwrap_or_else(|err| {
+            panic!("{SEED_ENV}={raw:?} is not a valid u64 (leading/trailing whitespace is trimmed): {err}")
+        }),
+    }
+}
+
+/// The equivalent *test* invocation for a harness configuration.
+///
+/// The soak binary runs the same workload, but only the test takes the exact `#[tokio::test]`
+/// path (same bootstrap, same allocator), so the override belongs next to the printed command
+/// instead of being something a reader has to infer.
+///
+/// `--exact` is required: libtest matches filters as substrings, so a bare
+/// `model_testing::tests::harness` would also run `harness_no_optimizer`,
+/// `harness_no_optimizer_no_restarts`, `harness_no_optimizer_snapshots` and `harness_no_restarts`
+/// — several long runs in parallel, all consuming the same `MODEL_TESTING_SEED`.
+#[cfg(test)]
+fn test_replay_command(name: &str, seed: u64) -> String {
+    format!(
+        "MODEL_TESTING_SEED={seed} cargo test -p collection --lib model_testing::tests::{name} \
+         -- --exact --nocapture"
+    )
+}
+
+/// The equivalent soak-binary invocation for one harness configuration.
+///
+/// The harness tests only run on Linux, so a failure on any other platform is otherwise locked
+/// in CI. Printing this turns any failure into a one-line reproduction wherever the binary runs.
+///
+/// Every workload knob here is passed in from the same binding that `smoke` hands to `run`, so a
+/// printed command cannot silently describe different workload settings than the one that failed.
+/// The storage path is the one deliberate exception: the failed run keeps its own retained
+/// tempdir (printed beside the seed), while replay lands in a fresh repo-relative directory.
+#[cfg(test)]
+#[expect(clippy::too_many_arguments)]
+fn replay_command(
+    seed: u64,
+    op_num: usize,
+    id_pool: u64,
+    restart_probability: f64,
+    disable_optimizer: bool,
+    disable_snapshots: bool,
+    on_disk: bool,
+    pre_restart_check: bool,
+    enable_force_off: bool,
+    duration_sec: Option<u64>,
+) -> String {
+    let mut command = format!(
+        "cargo run --bin model_testing --features service_debug --profile perf -- \
+         --seed {seed} \
+         --op-num {op_num} \
+         --shard-count {HARNESS_SHARD_COUNT} \
+         --id-pool {id_pool} \
+         --uuid-id-fraction {HARNESS_UUID_ID_FRACTION} \
+         --max-segment-size-kb {HARNESS_MAX_SEGMENT_SIZE_KB} \
+         --indexing-threshold-kb {HARNESS_INDEXING_THRESHOLD_KB} \
+         --restart-probability {restart_probability} \
+         --swarm-interval {HARNESS_SWARM_INTERVAL} \
+         --storage-path ./storage-model"
+    );
+    for (enabled, flag) in [
+        (disable_optimizer, "--disable-optimizer"),
+        (disable_snapshots, "--disable-snapshots"),
+        (on_disk, "--on-disk"),
+        (pre_restart_check, "--pre-restart-check"),
+        (enable_force_off, "--enable-force-off"),
+    ] {
+        if enabled {
+            command.push(' ');
+            command.push_str(flag);
+        }
+    }
+    if let Some(seconds) = duration_sec {
+        command.push_str(&format!(" --duration-sec {seconds}"));
+    }
+    command
+}
+
 /// Linux-only: too slow on Windows and macOS CI
 #[cfg(target_os = "linux")]
 #[cfg(test)]
@@ -938,7 +1112,6 @@ mod tests {
     use super::*;
 
     const OP_NUM: usize = 8_000;
-    const ID_POOL: u64 = 500;
     // The non-snapshot gates run with snapshots off so they stay fast, deterministic baselines for
     // their own concern. `CreateSnapshot` does background snapshot IO that only adds wall-clock time
     // without testing what those gates target; the snapshot path has its own test
@@ -989,9 +1162,12 @@ mod tests {
     /// `name` is the calling test's name, echoed in both the seed line and the failure message
     /// so a failure in this shared helper is attributable to the right test.
     ///
-    /// The seed is drawn fresh each run and printed up front so a CI failure is reproducible
-    /// (nextest captures stdout and shows it on failure); on panic [`StorageGuard`] retains the
-    /// storage dir.
+    /// The seed is drawn fresh each run unless `MODEL_TESTING_SEED` overrides it, and both the
+    /// seed and the equivalent `model_testing` invocation are printed up front, so a CI failure is
+    /// reproducible (nextest captures stdout and shows it on failure/timeout); on panic
+    /// [`StorageGuard`] retains the storage dir. Stage/op breadcrumbs (`model_testing: …` stdout
+    /// lines) land in the same dump so a hung run names the last op or reload stage that never
+    /// returned.
     async fn smoke(
         name: &'static str,
         disable_optimizer: bool,
@@ -1000,8 +1176,40 @@ mod tests {
         op_num: usize,
     ) {
         let storage_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let seed = rand::rng().random();
-        println!("model_testing: {name} seed = {seed}");
+        let seed = resolve_seed(seed_override(std::env::var(SEED_ENV)).as_deref(), || {
+            rand::rng().random()
+        });
+        // Bind every knob once and hand the same binding to `run` and to the printed replay
+        // command, so the two cannot describe different configurations.
+        let on_disk = false; // in-RAM vectors: the reload checks target the on-disk metadata/WAL
+        let pre_restart_check = false; // off: a cold close+reopen surfaces more reload bugs
+        let enable_force_off = false;
+        // `run` takes a `Duration`; the printed command takes seconds. Bind the typed value once
+        // and derive the printed form, so the two cannot disagree.
+        let duration: Option<Duration> = None; // bounded by op_num
+        println!(
+            "model_testing: {name} seed = {seed} storage = {}",
+            storage_dir.path().display()
+        );
+        println!(
+            "model_testing: {name} or: {}",
+            test_replay_command(name, seed)
+        );
+        println!(
+            "model_testing: {name} replay with: {}",
+            replay_command(
+                seed,
+                op_num,
+                HARNESS_ID_POOL,
+                restart_probability,
+                disable_optimizer,
+                disable_snapshots,
+                on_disk,
+                pre_restart_check,
+                enable_force_off,
+                duration.map(|d| d.as_secs()),
+            )
+        );
         let guard = StorageGuard {
             dir: Some(storage_dir),
             name,
@@ -1010,20 +1218,20 @@ mod tests {
         run(
             seed,
             op_num,
-            1, // shard_count
-            ID_POOL,
-            0.5, // uuid_id_fraction: mixed numeric/UUID ids
+            HARNESS_SHARD_COUNT,
+            HARNESS_ID_POOL,
+            HARNESS_UUID_ID_FRACTION, // uuid_id_fraction: mixed numeric/UUID ids
             guard.path(),
             disable_optimizer,
-            10, // max_segment_size_kb
-            5,  // indexing_threshold_kb
+            HARNESS_MAX_SEGMENT_SIZE_KB,
+            HARNESS_INDEXING_THRESHOLD_KB,
             restart_probability,
-            2500,  // swarm_interval: a few redraws within the run
-            false, // on_disk
-            false, // pre_restart_check
-            false, // enable_force_off
+            HARNESS_SWARM_INTERVAL,
+            on_disk,
+            pre_restart_check,
+            enable_force_off,
             disable_snapshots,
-            None, // duration: bounded by op_num
+            duration,
             Arc::new(AtomicBool::new(false)),
         )
         .await;
@@ -1123,5 +1331,138 @@ mod tests {
             OP_NUM,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod seed_support_tests {
+    use super::*;
+
+    #[test]
+    fn seed_override_is_honoured_without_drawing() {
+        let mut draws = 0;
+        let mut draw = || {
+            draws += 1;
+            1
+        };
+        assert_eq!(resolve_seed(Some("42"), &mut draw), 42);
+        // A seed copy-pasted out of CI logs keeps its surrounding whitespace.
+        assert_eq!(
+            resolve_seed(Some(" 14300108231980309333 \n"), &mut draw),
+            14300108231980309333
+        );
+        assert_eq!(draws, 0, "an override must not draw a fresh seed");
+    }
+
+    #[test]
+    fn absent_or_blank_override_draws_a_fresh_seed() {
+        let mut draws = 0;
+        let mut draw = || {
+            draws += 1;
+            7
+        };
+        assert_eq!(resolve_seed(None, &mut draw), 7);
+        assert_eq!(resolve_seed(Some("   "), &mut draw), 7);
+        assert_eq!(draws, 2, "both the absent and the blank override draw");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a valid u64")]
+    fn malformed_override_panics_instead_of_silently_ignoring() {
+        resolve_seed(Some("not-a-number"), || 0);
+    }
+
+    /// An unset variable means "explore", so it falls through to a fresh draw.
+    #[test]
+    fn unset_override_is_absent() {
+        assert_eq!(seed_override(Err(std::env::VarError::NotPresent)), None);
+    }
+
+    #[test]
+    fn readable_override_is_returned_verbatim() {
+        assert_eq!(seed_override(Ok("42".to_owned())), Some("42".to_owned()));
+    }
+
+    /// A set-but-garbled override must fail loudly: silently drawing a fresh seed would look like
+    /// a replay while running a different sequence.
+    #[test]
+    #[should_panic(expected = "is set but unusable")]
+    fn unreadable_override_panics() {
+        seed_override(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("garbled"),
+        )));
+    }
+
+    /// The second printed line must name the test path itself, so the exact `#[tokio::test]`
+    /// (not just the binary) can be re-run with the failing seed.
+    #[test]
+    fn test_replay_command_points_at_the_same_test() {
+        assert_eq!(
+            test_replay_command("harness_no_optimizer_no_restarts", 424242),
+            "MODEL_TESTING_SEED=424242 cargo test -p collection --lib \
+             model_testing::tests::harness_no_optimizer_no_restarts -- --exact --nocapture"
+        );
+    }
+
+    /// The printed command must describe the configuration the harness actually ran. Asserted as an
+    /// exact token sequence rather than substrings, so a missing separator, a duplicated flag, or a
+    /// reordered flag fails here too.
+    #[test]
+    fn replay_command_carries_the_full_harness_configuration() {
+        let command = replay_command(7, 2_000, 500, 0.002, false, true, false, false, false, None);
+        assert_eq!(
+            command.split_whitespace().collect::<Vec<_>>(),
+            vec![
+                "cargo",
+                "run",
+                "--bin",
+                "model_testing",
+                "--features",
+                "service_debug",
+                "--profile",
+                "perf",
+                "--",
+                "--seed",
+                "7",
+                "--op-num",
+                "2000",
+                "--shard-count",
+                "1",
+                "--id-pool",
+                "500",
+                "--uuid-id-fraction",
+                "0.5",
+                "--max-segment-size-kb",
+                "10",
+                "--indexing-threshold-kb",
+                "5",
+                "--restart-probability",
+                "0.002",
+                "--swarm-interval",
+                "2500",
+                "--storage-path",
+                "./storage-model",
+                "--disable-snapshots",
+            ]
+        );
+    }
+
+    /// Every conditional flag is emitted, in a stable order, exactly when its knob is on.
+    #[test]
+    fn replay_command_flags_follow_every_knob() {
+        let all_on = replay_command(1, 4_000, 500, 0.0, true, true, true, true, true, Some(30));
+        let tokens: Vec<_> = all_on.split_whitespace().collect();
+        assert_eq!(
+            &tokens[tokens.len() - 7..],
+            [
+                "--disable-optimizer",
+                "--disable-snapshots",
+                "--on-disk",
+                "--pre-restart-check",
+                "--enable-force-off",
+                "--duration-sec",
+                "30",
+            ]
+        );
     }
 }

@@ -1,4 +1,5 @@
 mod reexports_from_qdrant_crates {
+    pub use common::budget::ResourceBudget;
     pub use segment::common::operation_error::{OperationError, OperationResult};
     pub use segment::data_types::facets::{FacetHit, FacetResponse, FacetValue, FacetValueHit};
     pub use segment::data_types::fully_qualified_point::FullyQualifiedPoint;
@@ -26,14 +27,15 @@ mod reexports_from_qdrant_crates {
         ExtendedPointId as PointId, FieldCondition, Filter, GeoBoundingBox, GeoLineString,
         GeoPoint, GeoPolygon, GeoRadius, HasIdCondition, HasVectorCondition,
         HnswConfig as HnswIndexConfig, IdfCorpusParams, IdfParams, IdfScope, IsEmptyCondition,
-        IsNullCondition, Match, MatchAny, MatchExcept, MatchPhrase, MatchPrefix, MatchText,
-        MatchTextAny, MatchValue, MinShould, MultiVectorComparator, MultiVectorConfig, Nested,
-        NestedCondition, Payload, PayloadFieldSchema, PayloadIndexInfo, PayloadSchemaParams,
-        PayloadSchemaType, PayloadSelector, PayloadSelectorExclude, PayloadSelectorInclude,
-        ProductQuantizationConfig, QuantizationConfig, QuantizationSearchParams, Range,
-        RangeInterface, ScalarQuantizationConfig, ScalarType, ScoredPoint, SearchParams,
-        SegmentConfig, SegmentState, Slice, SliceCondition, SparseVectorDataConfig, ValueVariants,
-        ValuesCount, VectorDataConfig, VectorStorageDatatype, WithPayloadInterface, WithVector,
+        IsNullCondition, Match, MatchAny, MatchExcept, MatchPhrase, MatchPrefix, MatchSubstring,
+        MatchText, MatchTextAny, MatchValue, Memory, MinShould, MultiVectorComparator,
+        MultiVectorConfig, Nested, NestedCondition, Payload, PayloadFieldSchema, PayloadIndexInfo,
+        PayloadSchemaParams, PayloadSchemaType, PayloadSelector, PayloadSelectorExclude,
+        PayloadSelectorInclude, ProductQuantizationConfig, QuantizationConfig,
+        QuantizationSearchParams, Range, RangeInterface, ScalarQuantizationConfig, ScalarType,
+        ScoredPoint, SearchParams, SegmentConfig, SegmentState, Slice, SliceCondition,
+        SparseVectorDataConfig, ValueVariants, ValuesCount, VectorDataConfig,
+        VectorStorageDatatype, WithPayloadInterface, WithVector,
     };
     pub use segment::vector_storage::query::{
         ContextPair, ContextQuery, DiscoverQuery, FeedbackItem,

@@ -2,11 +2,10 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::task::Poll;
 
-use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use parking_lot::Mutex;
 
 mod async_io;
@@ -14,7 +13,7 @@ mod async_io;
 use crate::mmap::AdviceSetting;
 use crate::universal_io::{
     CachedReadFs, ListedFile, OpenExtra, OpenOptions, Populate, UioResult, UniversalIoError,
-    UniversalReadFileOps, UniversalReadFs, UniversalReadFsAsync, UniversalWriteFileOps,
+    UniversalReadFs, UniversalReadFsAsync, UniversalWriteFs,
 };
 
 #[derive(Clone, Debug)]
@@ -57,7 +56,7 @@ impl FileInfo {
 /// implementation.
 ///
 /// The write side is a passthrough: writable opens and
-/// [`UniversalWriteFileOps`] forward to the wrapped filesystem and do NOT
+/// [`UniversalWriteFs`] forward to the wrapped filesystem and do NOT
 /// update the snapshot — reads that must observe a post-snapshot mutation
 /// need a fresh [`CachedFs::cache_file_info`].
 ///
@@ -202,18 +201,8 @@ impl<Fs: UniversalReadFs> CachedFs<Fs> {
             })
             .collect()
     }
-}
 
-/// The one impl with the `UniversalReadFsAsync` bound: `schedule_open` /
-/// `reschedule_open` park the inner filesystem's `open_async` futures in the
-/// prefetch pool. Everything else on `CachedFs` (including consuming parked
-/// futures in `open`) works over a plain `UniversalReadFs`.
-impl<Fs: UniversalReadFsAsync> CachedReadFs for CachedFs<Fs> {
-    /// Take a LIST snapshot of the filesystem and drop prefetched files.
-    fn cache_file_info(&mut self) -> UioResult<()> {
-        // List all files
-        let list = self.fs.list_files(&self.prefix_path)?;
-
+    fn apply_file_info(&mut self, list: Vec<ListedFile>) {
         let files_info: HashMap<_, _> = list
             .into_iter()
             .map(
@@ -235,7 +224,28 @@ impl<Fs: UniversalReadFsAsync> CachedReadFs for CachedFs<Fs> {
 
         self.files_info = Some(files_info);
         self.files_prefetched.lock().clear();
+    }
+}
 
+impl<Fs: UniversalReadFsAsync> CachedFs<Fs> {
+    /// Async counterpart of [`CachedReadFs::cache_file_info`].
+    pub async fn cache_file_info_async(&mut self) -> UioResult<()> {
+        let list = self.fs.list_files_async(&self.prefix_path).await?;
+        self.apply_file_info(list);
+        Ok(())
+    }
+}
+
+/// The `UniversalReadFsAsync`-bound impls: `schedule_open` / `reschedule_open`
+/// park the inner filesystem's `open_async` futures in the prefetch pool, and
+/// `cache_file_info_async` awaits its LIST. Everything else on `CachedFs`
+/// (including consuming parked futures in `open`) works over a plain
+/// `UniversalReadFs`.
+impl<Fs: UniversalReadFsAsync> CachedReadFs for CachedFs<Fs> {
+    /// Take a LIST snapshot of the filesystem and drop prefetched files.
+    fn cache_file_info(&mut self) -> UioResult<()> {
+        let list = self.fs.list_files(&self.prefix_path)?;
+        self.apply_file_info(list);
         Ok(())
     }
 
@@ -286,12 +296,10 @@ impl<Fs: UniversalReadFsAsync> CachedReadFs for CachedFs<Fs> {
             Box::pin(async move { fs.open_async(path_owned, open_options, open_extra).await });
 
         // Poll once, so that real async work begins right away
-        let scheduled = futures::executor::block_on(async move {
-            match futures::poll!(fut.as_mut()) {
-                Poll::Ready(file) => ScheduledFile::Ready(file),
-                Poll::Pending => ScheduledFile::Future(fut),
-            }
-        });
+        let scheduled = match fut.as_mut().now_or_never() {
+            Some(file) => ScheduledFile::Ready(file),
+            None => ScheduledFile::Future(fut),
+        };
         files_prefetched.insert(path.to_path_buf(), scheduled);
     }
 
@@ -319,10 +327,13 @@ impl<Fs: UniversalReadFsAsync> CachedReadFs for CachedFs<Fs> {
         self.schedule_open(path, open_arguments, open_extra)
     }
 
-    fn schedule(&self, path: PathBuf, fut: BoxFuture<'static, UioResult<Fs::File>>) {
-        self.files_prefetched
-            .lock()
-            .insert(path, ScheduledFile::Future(fut));
+    fn schedule(&self, path: PathBuf, mut fut: BoxFuture<'static, UioResult<Fs::File>>) {
+        // Poll once, so that real async work begins right away
+        let scheduled = match fut.as_mut().now_or_never() {
+            Some(file) => ScheduledFile::Ready(file),
+            None => ScheduledFile::Future(fut),
+        };
+        self.files_prefetched.lock().insert(path, scheduled);
     }
 
     fn wait_all(&self) -> impl Future<Output = ()> + Send + 'static + use<Fs> {
@@ -359,7 +370,12 @@ pub struct CachedReadFsContext<C> {
     pub prefix_path: PathBuf,
 }
 
-impl<Fs: UniversalReadFs> UniversalReadFileOps for CachedFs<Fs> {
+impl<Fs: UniversalReadFs> UniversalReadFs for CachedFs<Fs> {
+    /// The *wrapped* backend's file type: opening through the cache hands
+    /// out the very handles the inner filesystem produced (prefetched or
+    /// fallback-opened), so the wrapper never appears in stored types.
+    type File = Fs::File;
+    type OpenExtra = Fs::OpenExtra;
     type ContextConfig = CachedReadFsContext<Fs::ContextConfig>;
 
     fn from_context(context: Self::ContextConfig) -> UioResult<Self> {
@@ -380,74 +396,6 @@ impl<Fs: UniversalReadFs> UniversalReadFileOps for CachedFs<Fs> {
             None => self.fs.exists(path),
         }
     }
-}
-
-impl<Fs: UniversalReadFs> Debug for CachedFs<Fs> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            fs,
-            prefix_path,
-            files_info,
-            previous_files_info,
-            files_prefetched,
-        } = self;
-        f.debug_struct("CachedReadFs")
-            .field("fs", fs)
-            .field("prefix_path", prefix_path)
-            .field("files_info", files_info)
-            .field("previous_files_info", previous_files_info)
-            .field("files_prefetched", &*files_prefetched.lock())
-            .finish()
-    }
-}
-
-impl<Fs> UniversalWriteFileOps for CachedFs<Fs>
-where
-    Fs: UniversalReadFs + UniversalWriteFileOps,
-{
-    type AppendFile = Fs::AppendFile;
-
-    fn create(&self, path: &Path, expected_length: usize) -> UioResult<()> {
-        self.fs.create(path, expected_length)
-    }
-
-    fn create_dir(&self, path: &Path) -> UioResult<()> {
-        self.fs.create_dir(path)
-    }
-
-    fn remove(&self, path: &Path) -> UioResult<()> {
-        // Drop any prefetched handle so a pooled open cannot resurrect the
-        // removed file.
-        self.files_prefetched.lock().remove(path);
-        self.fs.remove(path)
-    }
-
-    fn remove_dir(&self, path: &Path) -> UioResult<()> {
-        self.files_prefetched
-            .lock()
-            .retain(|pooled, _| !pooled.starts_with(path));
-        self.fs.remove_dir(path)
-    }
-
-    fn atomic_save(&self, path: &Path, bytes: &[u8]) -> UioResult<()> {
-        self.fs.atomic_save(path, bytes)
-    }
-
-    fn open_append(
-        &self,
-        path: impl AsRef<Path>,
-        options: OpenOptions,
-    ) -> UioResult<Self::AppendFile> {
-        self.fs.open_append(path, options)
-    }
-}
-
-impl<Fs: UniversalReadFs> UniversalReadFs for CachedFs<Fs> {
-    /// The *wrapped* backend's file type: opening through the cache hands
-    /// out the very handles the inner filesystem produced (prefetched or
-    /// fallback-opened), so the wrapper never appears in stored types.
-    type File = Fs::File;
-    type OpenExtra = Fs::OpenExtra;
 
     fn open(
         &self,
@@ -496,5 +444,65 @@ impl<Fs: UniversalReadFs> UniversalReadFs for CachedFs<Fs> {
             None => extra,
         };
         self.fs.open(path, options, extra)
+    }
+}
+
+impl<Fs: UniversalReadFs> Debug for CachedFs<Fs> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            fs,
+            prefix_path,
+            files_info,
+            previous_files_info,
+            files_prefetched,
+        } = self;
+        f.debug_struct("CachedReadFs")
+            .field("fs", fs)
+            .field("prefix_path", prefix_path)
+            .field("files_info", files_info)
+            .field("previous_files_info", previous_files_info)
+            .field("files_prefetched", &*files_prefetched.lock())
+            .finish()
+    }
+}
+
+impl<Fs> UniversalWriteFs for CachedFs<Fs>
+where
+    Fs: UniversalWriteFs,
+{
+    type AppendFile = Fs::AppendFile;
+
+    fn create(&self, path: &Path, expected_length: usize) -> UioResult<()> {
+        self.fs.create(path, expected_length)
+    }
+
+    fn create_dir(&self, path: &Path) -> UioResult<()> {
+        self.fs.create_dir(path)
+    }
+
+    fn remove(&self, path: &Path) -> UioResult<()> {
+        // Drop any prefetched handle so a pooled open cannot resurrect the
+        // removed file.
+        self.files_prefetched.lock().remove(path);
+        self.fs.remove(path)
+    }
+
+    fn remove_dir(&self, path: &Path) -> UioResult<()> {
+        self.files_prefetched
+            .lock()
+            .retain(|pooled, _| !pooled.starts_with(path));
+        self.fs.remove_dir(path)
+    }
+
+    fn atomic_save(&self, path: &Path, bytes: &[u8]) -> UioResult<()> {
+        self.fs.atomic_save(path, bytes)
+    }
+
+    fn open_append(
+        &self,
+        path: impl AsRef<Path>,
+        options: OpenOptions,
+    ) -> UioResult<Self::AppendFile> {
+        self.fs.open_append(path, options)
     }
 }
