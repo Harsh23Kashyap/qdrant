@@ -49,10 +49,13 @@ const REST_ENDPOINT_WHITELIST: &[&str] = &[
 const GRPC_ENDPOINT_WHITELIST: &[&str] = &[
     "/qdrant.Points/ClearPayload",
     "/qdrant.Points/Count",
+    "/qdrant.Points/CreateFieldIndex",
     "/qdrant.Points/CreateVectorName",
     "/qdrant.Points/Delete",
+    "/qdrant.Points/DeleteFieldIndex",
     "/qdrant.Points/DeletePayload",
     "/qdrant.Points/DeleteVectorName",
+    "/qdrant.Points/DeleteVectors",
     "/qdrant.Points/Discover",
     "/qdrant.Points/DiscoverBatch",
     "/qdrant.Points/Facet",
@@ -68,6 +71,8 @@ const GRPC_ENDPOINT_WHITELIST: &[&str] = &[
     "/qdrant.Points/Search",
     "/qdrant.Points/SearchBatch",
     "/qdrant.Points/SearchGroups",
+    "/qdrant.Points/SearchMatrixOffsets",
+    "/qdrant.Points/SearchMatrixPairs",
     "/qdrant.Points/SetPayload",
     "/qdrant.Points/UpdateBatch",
     "/qdrant.Points/UpdateVectors",
@@ -453,6 +458,51 @@ mod tests {
             "Expected collection label in output:\n{output}"
         );
         assert!(output.contains("grpc_responses_total"));
+    }
+
+    #[test]
+    fn test_grpc_metrics_include_whitelisted_endpoints() {
+        use std::collections::HashMap;
+
+        use segment::common::operation_time_statistics::OperationDurationStatistics;
+
+        use super::{GrpcTelemetry, MetricsData, MetricsProvider};
+
+        let endpoints = [
+            "/qdrant.Points/CreateFieldIndex",
+            "/qdrant.Points/DeleteFieldIndex",
+            "/qdrant.Points/DeleteVectors",
+            "/qdrant.Points/SearchMatrixOffsets",
+            "/qdrant.Points/SearchMatrixPairs",
+        ];
+        let responses = endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let status_map = HashMap::from([(
+                    0i32,
+                    OperationDurationStatistics {
+                        count: 1,
+                        ..Default::default()
+                    },
+                )]);
+                (endpoint.to_string(), status_map)
+            })
+            .collect();
+        let telemetry = GrpcTelemetry {
+            responses,
+            per_collection_responses: HashMap::new(),
+        };
+
+        let mut metrics = MetricsData::empty();
+        telemetry.add_metrics(&mut metrics, None);
+        let output = metrics.format_metrics();
+
+        for endpoint in endpoints {
+            assert!(
+                output.contains(endpoint),
+                "Expected metrics for {endpoint} in output:\n{output}"
+            );
+        }
     }
 
     #[test]
